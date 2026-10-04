@@ -74,6 +74,8 @@ static inline NetAddr net_addr_create(const char *ip_str, int port)
     addr.in.sin_port = htons((unsigned short)port);
     if (!ip_str || strcmp(ip_str, "") == 0 || strcmp(ip_str, "0.0.0.0") == 0) {
         addr.in.sin_addr.s_addr = INADDR_ANY;
+    } else if (strcmp(ip_str, "localhost") == 0) {
+        addr.in.sin_addr.s_addr = inet_addr("127.0.0.1");
     } else {
         addr.in.sin_addr.s_addr = inet_addr(ip_str);
     }
