@@ -30,6 +30,8 @@
 #define SARPBC_MODEL_IMPLEMENTATION
 #include "sarpbc_model.h"
 
+#include "net_client.h"
+
 #define V3(x, y, z) ((Vector3){ (x), (y), (z) })
 
 /* ------------------------------------------------------------------------ */
@@ -953,7 +955,7 @@ static int car_car_collide(Car *a, Car *b)
 /* ------------------------------------------------------------------------ */
 /* Bots                                                                       */
 /* ------------------------------------------------------------------------ */
-#define MAX_CARS 6
+#define MAX_CARS 8
 #define PRED_DT  (1.0f / 30.0f)
 #define PRED_N   150                  /* 5 s of ball prediction */
 
@@ -3496,7 +3498,7 @@ static int load_car(const char *name, Car *car, CarRender *cr, Shader lit, int r
 /* ------------------------------------------------------------------------ */
 /* Menus                                                                      */
 /* ------------------------------------------------------------------------ */
-typedef enum { SCR_MENU, SCR_SETTINGS, SCR_GAME, SCR_PAUSE } Screen;
+typedef enum { SCR_MENU, SCR_ONLINE_JOIN, SCR_SETTINGS, SCR_GAME, SCR_PAUSE } Screen;
 
 typedef struct Nav { int up, down, left, right, ok, back; } Nav;
 
@@ -3931,6 +3933,126 @@ static void menu_run(const char *title, MenuItem *it, int n, int *sel, Nav nav, 
 }
 
 /* ------------------------------------------------------------------------ */
+/* Online Multiplayer HUD & Scoreboard                                       */
+/* ------------------------------------------------------------------------ */
+static void net_client_draw_nameplates(const NetClient *cli, const Vector3 *carPositions, const int *carTeams, const int *demolished, Camera3D cam)
+{
+    if (!cli || cli->state != NET_CONNECTED) return;
+    int sw = GetScreenWidth(), sh = GetScreenHeight();
+
+    for (int i = 0; i < SARP_MAX_CLIENTS; i++) {
+        if (!cli->players[i].active || i == cli->localSlot) continue;
+        if (demolished && demolished[i]) continue;
+
+        Vector3 headPos = V3(carPositions[i].x, carPositions[i].y + 1.8f, carPositions[i].z);
+        float dist = Vector3Distance(cam.position, headPos);
+        if (dist > 180.0f) continue;
+
+        Vector3 camToTarget = Vector3Subtract(headPos, cam.position);
+        Vector3 camFwd = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
+        if (Vector3DotProduct(camToTarget, camFwd) <= 0.1f) continue;
+
+        Vector2 sp = GetWorldToScreen(headPos, cam);
+        if (sp.x < -100 || sp.x > sw + 100 || sp.y < -100 || sp.y > sh + 100) continue;
+
+        const char *name = cli->players[i].name;
+        int fontSize = dist < 40.0f ? 16 : dist < 90.0f ? 14 : 12;
+        int tw = MeasureText(name, fontSize);
+        int padX = 10, padY = 5;
+        Rectangle plate = { sp.x - tw / 2.0f - padX, sp.y - fontSize / 2.0f - padY, (float)tw + padX * 2, (float)fontSize + padY * 2 };
+
+        int team = (carTeams != NULL) ? carTeams[i] : cli->players[i].team;
+        Color teamBg = team == 0 ? (Color){ 20, 70, 160, 200 } : (Color){ 180, 70, 20, 200 };
+        Color teamBorder = team == 0 ? (Color){ 60, 150, 255, 230 } : (Color){ 255, 140, 50, 230 };
+
+        DrawRectangleRounded(plate, 0.4f, 4, teamBg);
+        DrawRectangleRoundedLinesEx(plate, 0.4f, 4, 1.2f, teamBorder);
+        DrawText(name, (int)plate.x + padX, (int)plate.y + padY, fontSize, RAYWHITE);
+    }
+}
+
+static void net_client_draw_scoreboard(const NetClient *cli, int sw, int sh)
+{
+    if (!cli || cli->state != NET_CONNECTED) return;
+
+    int panelW = 680, panelH = 340;
+    int px = sw / 2 - panelW / 2, py = sh / 2 - panelH / 2;
+
+    DrawRectangleRounded((Rectangle){ (float)px + 4, (float)py + 6, (float)panelW, (float)panelH }, 0.15f, 6, (Color){ 0, 0, 0, 160 });
+    DrawRectangleRounded((Rectangle){ (float)px, (float)py, (float)panelW, (float)panelH }, 0.15f, 6, (Color){ 12, 16, 26, 240 });
+    DrawRectangleRoundedLinesEx((Rectangle){ (float)px, (float)py, (float)panelW, (float)panelH }, 0.15f, 6, 2.0f, (Color){ 45, 75, 120, 220 });
+
+    DrawText("ONLINE MATCH SCOREBOARD", px + 24, py + 16, 22, (Color){ 255, 185, 50, 255 });
+    const char *srvInfo = TextFormat("%s:%d  |  Ping: %.0f ms", cli->serverIp, cli->serverPort, cli->pingMs);
+    DrawText(srvInfo, px + panelW - MeasureText(srvInfo, 14) - 24, py + 22, 14, (Color){ 170, 195, 225, 220 });
+    DrawRectangle(px + 24, py + 48, panelW - 48, 1, (Color){ 45, 65, 95, 180 });
+
+    int colW = panelW / 2 - 32;
+
+    DrawRectangleRounded((Rectangle){ (float)(px + 20), (float)(py + 60), (float)colW, 32 }, 0.2f, 4, (Color){ 20, 65, 150, 230 });
+    DrawText(TextFormat("BLUE TEAM   (%d)", cli->scoreBlue), px + 32, py + 68, 16, (Color){ 200, 230, 255, 255 });
+
+    DrawRectangleRounded((Rectangle){ (float)(px + panelW / 2 + 12), (float)(py + 60), (float)colW, 32 }, 0.2f, 4, (Color){ 165, 65, 15, 230 });
+    DrawText(TextFormat("ORANGE TEAM   (%d)", cli->scoreOrange), px + panelW / 2 + 24, py + 68, 16, (Color){ 255, 225, 200, 255 });
+
+    int blueRow = 0, orangeRow = 0;
+    for (int i = 0; i < SARP_MAX_CLIENTS; i++) {
+        if (!cli->players[i].active) continue;
+        int isBlue = (cli->players[i].team == 0);
+        int rx = isBlue ? px + 20 : px + panelW / 2 + 12;
+        int ry = py + 102 + (isBlue ? blueRow++ : orangeRow++) * 36;
+
+        int isLocal = (i == cli->localSlot);
+        Color rowBg = isLocal ? (Color){ 35, 60, 95, 240 } : (Color){ 18, 24, 36, 180 };
+        Color rowBorder = isLocal ? (Color){ 255, 190, 50, 255 } : (Color){ 35, 45, 65, 160 };
+
+        DrawRectangleRounded((Rectangle){ (float)rx, (float)ry, (float)colW, 30 }, 0.25f, 4, rowBg);
+        DrawRectangleRoundedLinesEx((Rectangle){ (float)rx, (float)ry, (float)colW, 30 }, 0.25f, 4, 1.0f, rowBorder);
+
+        const char *pName = cli->players[i].name;
+        if (isLocal) pName = TextFormat("%s (YOU)", pName);
+        DrawText(pName, rx + 12, ry + 7, 15, isLocal ? (Color){ 255, 225, 120, 255 } : RAYWHITE);
+
+        const char *carStr = CAR_NAMES[cli->players[i].car_model % CAR_COUNT];
+        DrawText(carStr, rx + colW - MeasureText(carStr, 13) - 12, ry + 9, 13, (Color){ 160, 180, 210, 200 });
+    }
+
+    DrawText("Release [TAB] to close", px + panelW / 2 - MeasureText("Release [TAB] to close", 14) / 2, py + panelH - 24, 14, (Color){ 150, 165, 185, 180 });
+}
+
+static void net_client_draw_hud(const NetClient *cli, int sw, int sh)
+{
+    (void)sh;
+    if (!cli || cli->state != NET_CONNECTED) return;
+
+    int bw = 145, bh = 28;
+    int bx = sw - bw - 18, by = 14;
+
+    DrawRectangleRounded((Rectangle){ (float)bx + 2, (float)by + 2, (float)bw, (float)bh }, 0.35f, 4, (Color){ 0, 0, 0, 100 });
+    DrawRectangleRounded((Rectangle){ (float)bx, (float)by, (float)bw, (float)bh }, 0.35f, 4, (Color){ 12, 16, 26, 215 });
+    DrawRectangleRoundedLinesEx((Rectangle){ (float)bx, (float)by, (float)bw, (float)bh }, 0.35f, 4, 1.2f, (Color){ 45, 65, 95, 180 });
+
+    Color pingCol = cli->pingMs < 60.0f ? (Color){ 50, 220, 120, 255 } :
+                    cli->pingMs < 120.0f ? (Color){ 240, 200, 50, 255 } : (Color){ 240, 70, 70, 255 };
+
+    DrawCircle(bx + 14, by + bh / 2, 4.0f, pingCol);
+    const char *pingStr = TextFormat("ONLINE %.0fms", cli->pingMs);
+    DrawText(pingStr, bx + 26, by + 7, 13, RAYWHITE);
+
+    if (cli->demoBannerTimer > 0.0f) {
+        float alpha = fminf(1.0f, cli->demoBannerTimer);
+        const char *demoMsg = TextFormat("%s DEMOLISHED %s!", cli->demoKiller, cli->demoVictim);
+        int mw = MeasureText(demoMsg, 20);
+        int mwW = mw + 40, mwH = 36;
+        int mx = sw / 2 - mwW / 2, my = 75;
+
+        DrawRectangleRounded((Rectangle){ (float)mx, (float)my, (float)mwW, (float)mwH }, 0.35f, 4, ColorAlpha((Color){ 220, 60, 20, 230 }, alpha));
+        DrawRectangleRoundedLinesEx((Rectangle){ (float)mx, (float)my, (float)mwW, (float)mwH }, 0.35f, 4, 1.5f, ColorAlpha(YELLOW, alpha));
+        DrawText(demoMsg, mx + mwW / 2 - mw / 2, my + 8, 20, ColorAlpha(RAYWHITE, alpha));
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Main                                                                       */
 /* ------------------------------------------------------------------------ */
 #ifdef _WIN32
@@ -3967,9 +4089,14 @@ int sarpbc_main(int argc, char **argv)
     Ball rball;
     float camY = 0.0f;
     int camSnap = 1;
+    NetClient netClient;
+    int isOnline = 0, onlineSel = 4, prefTeamSel = 2, autoConnect = 0;
+    char customIpInput[32] = "127.0.0.1";
+    char playerNameInput[24] = "Striker";
 
     memset(crs, 0, sizeof(crs));
     memset(bots, 0, sizeof(bots));
+    net_client_init(&netClient);
     for (i = 0; i < MAX_CARS; i++) carModel[i] = -1;
     for (i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--test") == 0) testMode = 1;
@@ -3977,6 +4104,13 @@ int sarpbc_main(int argc, char **argv)
         else if (strcmp(argv[i], "--menushot") == 0) shotMode = 2;
         else if (strcmp(argv[i], "--carshot") == 0) shotMode = 3;
         else if (strcmp(argv[i], "--ballshot") == 0) shotMode = 4;
+        else if (strcmp(argv[i], "--connect") == 0 && i + 1 < argc) {
+            autoConnect = 1;
+            strncpy(customIpInput, argv[++i], sizeof(customIpInput) - 1);
+        }
+        else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+            strncpy(playerNameInput, argv[++i], sizeof(playerNameInput) - 1);
+        }
         else if (strncmp(argv[i], "--", 2) != 0) carArg = argv[i];
     }
 
@@ -4082,6 +4216,10 @@ int sarpbc_main(int argc, char **argv)
     cam.fovy = fov;
     cam.projection = CAMERA_PERSPECTIVE;
     if (shotMode == 1) screen = SCR_GAME;
+    if (autoConnect) {
+        net_client_connect(&netClient, customIpInput, netClient.serverPort, playerNameInput, g_set.car, g_set.skin, prefTeamSel);
+        screen = SCR_ONLINE_JOIN;
+    }
 
     while (!quit && !WindowShouldClose()) {
         float dt = fminf(GetFrameTime(), 0.1f);
@@ -4090,9 +4228,32 @@ int sarpbc_main(int argc, char **argv)
         int act = -1, adj = 0;
 
         /* ================= game update ================= */
+        if (isOnline) {
+            net_client_poll(&netClient, dt);
+            if (netClient.state == NET_DISCONNECTED) {
+                isOnline = 0;
+                screen = SCR_MENU;
+            }
+        }
+
         if (screen == SCR_GAME) {
             Input frame = read_input();
             int frozen;
+
+            if (isOnline) {
+                NetInput netIn;
+                memset(&netIn, 0, sizeof(netIn));
+                netIn.throttle = frame.throttle;
+                netIn.steer = frame.steer;
+                netIn.pitch = frame.pitch;
+                netIn.yaw = frame.yaw;
+                netIn.roll = frame.roll;
+                netIn.jump = (uint8_t)frame.jump;
+                netIn.jumpPressed = (uint8_t)frame.jumpPressed;
+                netIn.boost = (uint8_t)frame.boost;
+                netIn.slide = (uint8_t)frame.slide;
+                net_client_send_tick(&netClient, &netIn);
+            }
 
             if (demoBannerTimer > 0.0f) demoBannerTimer -= dt;
             if (camShake > 0.0f) camShake = fmaxf(0.0f, camShake - 2.5f * dt);
@@ -4115,7 +4276,9 @@ int sarpbc_main(int argc, char **argv)
             if (IsKeyPressed(KEY_C) || (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_UP)))
                 ballCam = !ballCam;
             if (IsKeyPressed(KEY_R) || (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_LEFT))) {
-                if (state == ST_OVER) NEW_MATCH(); else KICKOFF();
+                if (!isOnline) {
+                    if (state == ST_OVER) NEW_MATCH(); else KICKOFF();
+                }
             }
 
             /* edge-triggered input must survive frames with zero physics ticks */
@@ -4128,139 +4291,230 @@ int sarpbc_main(int argc, char **argv)
             while (acc >= 1.0f / PHYS_HZ) {
                 float h = 1.0f / PHYS_HZ;
                 Input tick = in;
-                for (i = 0; i < nCars; i++) { prevPos[i] = cars[i].pos; prevRot[i] = cars[i].rot; }
+                int activeCars = isOnline ? SARP_MAX_CLIENTS : nCars;
+                int mySlot = isOnline ? netClient.localSlot : 0;
+                for (i = 0; i < activeCars; i++) { prevPos[i] = cars[i].pos; prevRot[i] = cars[i].rot; }
                 prevBallPos = ball.pos; prevBallRot = ball.rot;
                 tick.jumpPressed = pendingJump;
                 pendingJump = 0;
 
-                /* Demolition respawn timers */
-                for (i = 0; i < nCars; i++) {
-                    if (cars[i].demolished) {
-                        cars[i].demoTimer -= h;
-                        if (cars[i].demoTimer <= 0.0f) {
-                            float spawnX = (p_randf() < 0.5f) ? -65.0f : 65.0f;
-                            float spawnZ = (team[i] == 0) ? -(ARENA_L - 28.0f) : (ARENA_L - 28.0f);
-                            float spawnYaw = (team[i] == 0) ? 0.0f : PI;
-                            car_reset(&cars[i], V3(spawnX, 0, spawnZ), spawnYaw);
-                            cars[i].boost = BOOST_START;
-                            cars[i].demolished = 0;
-                            cars[i].demoTimer = 0.0f;
-                            if (i == 0) camSnap = 1;
-                            particles_impact_burst(cars[i].pos, V3(0, 1, 0), 12.0f);
-                        }
-                    }
-                }
-
-                if (!cars[0].demolished) car_step(&cars[0], &tick, h);
-                if (nCars > 1) bot_world_update(&ball, h, pads, padTimer, PAD_COUNT);
-                for (i = 1; i < nCars; i++) {
-                    if (cars[i].demolished) continue;
-                    Input bi = bot_think(i, cars, team, nCars, &ball, &bots[i], botSkill, h);
-                    if (frozen) memset(&bi, 0, sizeof(bi));
-                    car_step(&cars[i], &bi, h);
-                }
-                ball_step(&ball, h);
-                for (i = 0; i < nCars; i++) {
-                    if (cars[i].demolished) continue;
-                    Vector3 prevBVel = ball.vel;
-                    if (car_ball_collide(&cars[i], &ball)) {
-                        float hitDelta = Vector3Distance(ball.vel, prevBVel);
-                        if (hitDelta > 3.0f) {
-                            Vector3 hitPoint = Vector3Lerp(cars[i].pos, ball.pos, 0.5f);
-                            Vector3 hitNorm = Vector3Normalize(Vector3Subtract(ball.pos, cars[i].pos));
-                            particles_impact_burst(hitPoint, hitNorm, hitDelta);
-                        }
-                    }
-                }
-                for (i = 0; i < nCars; i++) {
-                    if (cars[i].demolished) continue;
-                    for (j = i + 1; j < nCars; j++) {
-                        if (cars[j].demolished) continue;
-                        Vector3 velDiff = Vector3Subtract(cars[j].vel, cars[i].vel);
-                        float relSpeed = Vector3Length(velDiff);
-
-                        int demo = check_demolition(&cars[i], &cars[j], team[i], team[j]);
-                        if (demo != 0) {
-                            if (demo == 1) {
-                                demolish_car(j, i, cars, carModel, &demoBannerTimer, demoBannerText, sizeof(demoBannerText), &demoBannerColor, &camShake);
-                            } else if (demo == 2) {
-                                demolish_car(i, j, cars, carModel, &demoBannerTimer, demoBannerText, sizeof(demoBannerText), &demoBannerColor, &camShake);
-                            } else if (demo == 3) {
-                                demolish_car(i, j, cars, carModel, &demoBannerTimer, demoBannerText, sizeof(demoBannerText), &demoBannerColor, &camShake);
-                                demolish_car(j, i, cars, carModel, &demoBannerTimer, demoBannerText, sizeof(demoBannerText), &demoBannerColor, &camShake);
-                            }
-                            continue;
-                        }
-
-                        if (car_car_collide(&cars[i], &cars[j])) {
-                            if (relSpeed > 6.0f) {
-                                Vector3 hitPoint = Vector3Lerp(cars[i].pos, cars[j].pos, 0.5f);
-                                Vector3 hitNorm = Vector3Normalize(velDiff);
-                                particles_impact_burst(hitPoint, hitNorm, relSpeed);
+                if (!isOnline) {
+                    /* Demolition respawn timers */
+                    for (i = 0; i < nCars; i++) {
+                        if (cars[i].demolished) {
+                            cars[i].demoTimer -= h;
+                            if (cars[i].demoTimer <= 0.0f) {
+                                float spawnX = (p_randf() < 0.5f) ? -65.0f : 65.0f;
+                                float spawnZ = (team[i] == 0) ? -(ARENA_L - 28.0f) : (ARENA_L - 28.0f);
+                                float spawnYaw = (team[i] == 0) ? 0.0f : PI;
+                                car_reset(&cars[i], V3(spawnX, 0, spawnZ), spawnYaw);
+                                cars[i].boost = BOOST_START;
+                                cars[i].demolished = 0;
+                                cars[i].demoTimer = 0.0f;
+                                if (i == 0) camSnap = 1;
+                                particles_impact_burst(cars[i].pos, V3(0, 1, 0), 12.0f);
                             }
                         }
                     }
-                }
 
-                for (i = 0; i < PAD_COUNT; i++) {
-                    padTimer[i] -= h;
-                    for (j = 0; j < nCars && padTimer[i] <= 0.0f; j++) {
-                        if (cars[j].demolished) continue;
-                        float dx = cars[j].pos.x - pads[i].x, dz = cars[j].pos.z - pads[i].z;
-                        if (dx*dx + dz*dz < PAD_RADIUS * PAD_RADIUS && cars[j].pos.y < 4.0f) {
-                            cars[j].boost = BOOST_MAX;
-                            padTimer[i] = PAD_RESPAWN;
-                            particles_pad_pickup(pads[i]);
+                    if (!cars[0].demolished) car_step(&cars[0], &tick, h);
+                    if (nCars > 1) bot_world_update(&ball, h, pads, padTimer, PAD_COUNT);
+                    for (i = 1; i < nCars; i++) {
+                        if (cars[i].demolished) continue;
+                        Input bi = bot_think(i, cars, team, nCars, &ball, &bots[i], botSkill, h);
+                        if (frozen) memset(&bi, 0, sizeof(bi));
+                        car_step(&cars[i], &bi, h);
+                    }
+                    ball_step(&ball, h);
+                    for (i = 0; i < nCars; i++) {
+                        if (cars[i].demolished) continue;
+                        Vector3 prevBVel = ball.vel;
+                        if (car_ball_collide(&cars[i], &ball)) {
+                            float hitDelta = Vector3Distance(ball.vel, prevBVel);
+                            if (hitDelta > 3.0f) {
+                                Vector3 hitPoint = Vector3Lerp(cars[i].pos, ball.pos, 0.5f);
+                                Vector3 hitNorm = Vector3Normalize(Vector3Subtract(ball.pos, cars[i].pos));
+                                particles_impact_burst(hitPoint, hitNorm, hitDelta);
+                            }
                         }
                     }
+                    for (i = 0; i < nCars; i++) {
+                        if (cars[i].demolished) continue;
+                        for (j = i + 1; j < nCars; j++) {
+                            if (cars[j].demolished) continue;
+                            Vector3 velDiff = Vector3Subtract(cars[j].vel, cars[i].vel);
+                            float relSpeed = Vector3Length(velDiff);
+
+                            int demo = check_demolition(&cars[i], &cars[j], team[i], team[j]);
+                            if (demo != 0) {
+                                if (demo == 1) {
+                                    demolish_car(j, i, cars, carModel, &demoBannerTimer, demoBannerText, sizeof(demoBannerText), &demoBannerColor, &camShake);
+                                } else if (demo == 2) {
+                                    demolish_car(i, j, cars, carModel, &demoBannerTimer, demoBannerText, sizeof(demoBannerText), &demoBannerColor, &camShake);
+                                } else if (demo == 3) {
+                                    demolish_car(i, j, cars, carModel, &demoBannerTimer, demoBannerText, sizeof(demoBannerText), &demoBannerColor, &camShake);
+                                    demolish_car(j, i, cars, carModel, &demoBannerTimer, demoBannerText, sizeof(demoBannerText), &demoBannerColor, &camShake);
+                                }
+                                continue;
+                            }
+
+                            if (car_car_collide(&cars[i], &cars[j])) {
+                                if (relSpeed > 6.0f) {
+                                    Vector3 hitPoint = Vector3Lerp(cars[i].pos, cars[j].pos, 0.5f);
+                                    Vector3 hitNorm = Vector3Normalize(velDiff);
+                                    particles_impact_burst(hitPoint, hitNorm, relSpeed);
+                                }
+                            }
+                        }
+                    }
+
+                    for (i = 0; i < PAD_COUNT; i++) {
+                        padTimer[i] -= h;
+                        for (j = 0; j < nCars && padTimer[i] <= 0.0f; j++) {
+                            if (cars[j].demolished) continue;
+                            float dx = cars[j].pos.x - pads[i].x, dz = cars[j].pos.z - pads[i].z;
+                            if (dx*dx + dz*dz < PAD_RADIUS * PAD_RADIUS && cars[j].pos.y < 4.0f) {
+                                cars[j].boost = BOOST_MAX;
+                                padTimer[i] = PAD_RESPAWN;
+                                particles_pad_pickup(pads[i]);
+                            }
+                        }
+                    }
+
+                    if (state == ST_PLAY) {
+                        if (fabsf(ball.pos.z) > ARENA_L + BALL_R) {
+                            lastScorer = ball.pos.z > 0 ? 1 : 2;
+                            if (lastScorer == 1) scoreBlue++; else scoreOrange++;
+                            state = ST_GOAL; stateTimer = 3.0f;
+                            particles_goal_explosion(ball.pos, lastScorer);
+                            camShake = 1.0f;
+
+                            /* Shockwave blast impulse on nearby cars */
+                            for (i = 0; i < nCars; i++) {
+                                if (cars[i].demolished) continue;
+                                Vector3 toCar = Vector3Subtract(cars[i].pos, ball.pos);
+                                float d = Vector3Length(toCar);
+                                if (d < 65.0f) {
+                                    float p = (1.0f - d / 65.0f);
+                                    Vector3 dir = d > 0.1f ? Vector3Scale(toCar, 1.0f / d) : V3(0, 1, 0);
+                                    dir.y = fmaxf(dir.y, 0.45f);
+                                    dir = Vector3Normalize(dir);
+                                    cars[i].vel = Vector3Add(cars[i].vel, Vector3Scale(dir, p * 45.0f + 10.0f));
+                                    cars[i].angVel = Vector3Add(cars[i].angVel, p_randv3(-8.0f, 8.0f));
+                                }
+                            }
+                        }
+                        if (matchLen > 0.0f) {
+                            matchTime -= h;
+                            if (matchTime <= 0.0f) { matchTime = 0.0f; state = ST_OVER; }
+                        }
+                    }
+                } else {
+                    /* ONLINE Authoritative Physics Simulation */
+                    /* 1. Client prediction on local car */
+                    if (!cars[mySlot].demolished) {
+                        car_step(&cars[mySlot], &tick, h);
+                    }
+
+                    /* 2. Ball simulation & prediction */
+                    ball_step(&ball, h);
+                    if (!cars[mySlot].demolished) {
+                        Vector3 prevBVel = ball.vel;
+                        if (car_ball_collide(&cars[mySlot], &ball)) {
+                            float hitDelta = Vector3Distance(ball.vel, prevBVel);
+                            if (hitDelta > 3.0f) {
+                                Vector3 hitPoint = Vector3Lerp(cars[mySlot].pos, ball.pos, 0.5f);
+                                Vector3 hitNorm = Vector3Normalize(Vector3Subtract(ball.pos, cars[mySlot].pos));
+                                particles_impact_burst(hitPoint, hitNorm, hitDelta);
+                            }
+                        }
+                    }
+
+                    /* 3. Reconcile local car with authoritative server target */
+                    Vector3 srvPos = V3(netClient.players[mySlot].targetPos.x, netClient.players[mySlot].targetPos.y, netClient.players[mySlot].targetPos.z);
+                    Vector3 srvVel = V3(netClient.players[mySlot].targetVel.x, netClient.players[mySlot].targetVel.y, netClient.players[mySlot].targetVel.z);
+                    Quaternion srvRot = (Quaternion){ netClient.players[mySlot].targetRot.x, netClient.players[mySlot].targetRot.y, netClient.players[mySlot].targetRot.z, netClient.players[mySlot].targetRot.w };
+                    float errDist = Vector3Distance(cars[mySlot].pos, srvPos);
+                    if (errDist > 4.5f) {
+                        cars[mySlot].pos = srvPos;
+                        cars[mySlot].vel = srvVel;
+                        cars[mySlot].rot = srvRot;
+                        camSnap = 1;
+                    } else if (errDist > 0.05f) {
+                        cars[mySlot].pos = Vector3Lerp(cars[mySlot].pos, srvPos, 0.25f);
+                    }
+                    cars[mySlot].boost = netClient.players[mySlot].boost;
+                    cars[mySlot].demolished = netClient.players[mySlot].demolished;
+                    cars[mySlot].demoTimer = netClient.players[mySlot].demoTimer;
+
+                    /* 4. Remote cars smooth interpolation */
+                    for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+                        if (i == mySlot) continue;
+                        if (netClient.players[i].active) {
+                            if (carModel[i] != netClient.players[i].car_model) {
+                                load_car(CAR_NAMES[netClient.players[i].car_model % CAR_COUNT], &cars[i], &crs[i], lit, 1);
+                                carModel[i] = netClient.players[i].car_model % CAR_COUNT;
+                            }
+                            team[i] = netClient.players[i].team;
+                            Vector3 rPos = V3(netClient.players[i].targetPos.x, netClient.players[i].targetPos.y, netClient.players[i].targetPos.z);
+                            Vector3 rVel = V3(netClient.players[i].targetVel.x, netClient.players[i].targetVel.y, netClient.players[i].targetVel.z);
+                            Quaternion rRot = (Quaternion){ netClient.players[i].targetRot.x, netClient.players[i].targetRot.y, netClient.players[i].targetRot.z, netClient.players[i].targetRot.w };
+                            cars[i].pos = Vector3Lerp(cars[i].pos, rPos, 0.40f);
+                            cars[i].vel = rVel;
+                            cars[i].rot = QuaternionSlerp(cars[i].rot, rRot, 0.40f);
+                            cars[i].steerAngle = netClient.players[i].steerAngle;
+                            cars[i].wheelSpin = netClient.players[i].wheelSpin;
+                            cars[i].boost = netClient.players[i].boost;
+                            cars[i].demolished = netClient.players[i].demolished;
+                            cars[i].boosting = (Vector3Length(cars[i].vel) > 12.0f && cars[i].boost > 0.0f);
+                        } else {
+                            cars[i].pos = V3(0, -500, 0);
+                        }
+                    }
+
+                    /* 5. Ball reconciliation */
+                    Vector3 sbPos = V3(netClient.ballTargetPos.x, netClient.ballTargetPos.y, netClient.ballTargetPos.z);
+                    Vector3 sbVel = V3(netClient.ballTargetVel.x, netClient.ballTargetVel.y, netClient.ballTargetVel.z);
+                    Quaternion sbRot = (Quaternion){ netClient.ballTargetRot.x, netClient.ballTargetRot.y, netClient.ballTargetRot.z, netClient.ballTargetRot.w };
+                    float bDist = Vector3Distance(ball.pos, sbPos);
+                    if (bDist > 5.0f) {
+                        ball.pos = sbPos;
+                        ball.vel = sbVel;
+                        ball.rot = sbRot;
+                    } else if (bDist > 0.05f) {
+                        ball.pos = Vector3Lerp(ball.pos, sbPos, 0.40f);
+                        ball.vel = Vector3Lerp(ball.vel, sbVel, 0.40f);
+                        ball.rot = QuaternionSlerp(ball.rot, sbRot, 0.40f);
+                    }
+
+                    /* 6. Match state & scores */
+                    scoreBlue = netClient.scoreBlue;
+                    scoreOrange = netClient.scoreOrange;
+                    matchTime = netClient.serverMatchTime;
+                    if (netClient.serverGameState == 0) state = ST_COUNTDOWN;
+                    else if (netClient.serverGameState == 1) state = ST_PLAY;
+                    else if (netClient.serverGameState == 2) state = ST_GOAL;
+                    else if (netClient.serverGameState == 3) state = ST_OVER;
                 }
 
-                for (i = 0; i < nCars; i++) {
+                for (i = 0; i < activeCars; i++) {
+                    if (isOnline && !netClient.players[i].active) continue;
                     if (cars[i].demolished) continue;
                     if (cars[i].boosting && screen == SCR_GAME) {
                         particles_boost_emit(&cars[i], team[i] == 0);
                     }
                     Vector3 cr = car_right(&cars[i]);
                     float latSpeed = fabsf(Vector3DotProduct(cars[i].vel, cr));
-                    int isSliding = (i == 0) ? (in.slide) : 0;
+                    int isSliding = (i == mySlot) ? (in.slide) : 0;
                     particles_drift_emit(&cars[i], latSpeed, isSliding);
                     particles_supersonic_emit(&cars[i]);
-                }
-
-                if (state == ST_PLAY) {
-                    if (fabsf(ball.pos.z) > ARENA_L + BALL_R) {
-                        lastScorer = ball.pos.z > 0 ? 1 : 2;
-                        if (lastScorer == 1) scoreBlue++; else scoreOrange++;
-                        state = ST_GOAL; stateTimer = 3.0f;
-                        particles_goal_explosion(ball.pos, lastScorer);
-                        camShake = 1.0f;
-
-                        /* Shockwave blast impulse on nearby cars */
-                        for (i = 0; i < nCars; i++) {
-                            if (cars[i].demolished) continue;
-                            Vector3 toCar = Vector3Subtract(cars[i].pos, ball.pos);
-                            float d = Vector3Length(toCar);
-                            if (d < 65.0f) {
-                                float p = (1.0f - d / 65.0f);
-                                Vector3 dir = d > 0.1f ? Vector3Scale(toCar, 1.0f / d) : V3(0, 1, 0);
-                                dir.y = fmaxf(dir.y, 0.45f);
-                                dir = Vector3Normalize(dir);
-                                cars[i].vel = Vector3Add(cars[i].vel, Vector3Scale(dir, p * 45.0f + 10.0f));
-                                cars[i].angVel = Vector3Add(cars[i].angVel, p_randv3(-8.0f, 8.0f));
-                            }
-                        }
-                    }
-                    if (matchLen > 0.0f) {
-                        matchTime -= h;
-                        if (matchTime <= 0.0f) { matchTime = 0.0f; state = ST_OVER; }
-                    }
                 }
                 particles_update(h);
                 acc -= h;
             }
 
             /* --- match state machine ------------------------------------- */
-            if (screen == SCR_GAME) {
+            if (screen == SCR_GAME && !isOnline) {
                 stateTimer -= dt;
                 if (state == ST_COUNTDOWN && stateTimer <= 0.0f) state = ST_PLAY;
                 if (state == ST_GOAL && stateTimer <= 0.0f) {
@@ -4274,7 +4528,12 @@ int sarpbc_main(int argc, char **argv)
              * is smooth at any frame rate (teleports such as kickoffs snap) --------- */
             {
                 float alpha = clampf(acc * PHYS_HZ, 0.0f, 1.0f);
-                for (i = 0; i < nCars; i++) {
+                int activeCars = isOnline ? SARP_MAX_CLIENTS : nCars;
+                for (i = 0; i < activeCars; i++) {
+                    if (isOnline && !netClient.players[i].active) {
+                        rcars[i].pos = V3(0, -500, 0);
+                        continue;
+                    }
                     rcars[i] = cars[i];
                     if (Vector3Distance(prevPos[i], cars[i].pos) < 8.0f) {
                         rcars[i].pos = Vector3Lerp(prevPos[i], cars[i].pos, alpha);
@@ -4290,7 +4549,8 @@ int sarpbc_main(int argc, char **argv)
 
             /* --- chase camera: rigidly attached at a smoothed heading -------------- */
             if (screen == SCR_GAME) {
-                const Car *pc = &rcars[0];
+                int mySlot = isOnline ? netClient.localSlot : 0;
+                const Car *pc = &rcars[mySlot];
                 Vector3 f = car_fwd(pc), dirv, want, look;
                 float kd = 1.0f - expf(-8.0f * dt);
                 if (IsKeyDown(KEY_LEFT_BRACKET))  g_set.camDist = fmaxf(3.0f,  g_set.camDist - 4.0f * dt);
@@ -4328,7 +4588,7 @@ int sarpbc_main(int argc, char **argv)
                 fov = Lerp(fov, g_set.fov + (pc->boosting && g_set.boostFov ? 8.0f : 0.0f), 1.0f - expf(-4.0f * dt));
                 cam.fovy = fov;
             }
-        } else if (screen == SCR_MENU || (screen == SCR_SETTINGS && settingsFrom == SCR_MENU)) {
+        } else if (screen == SCR_MENU || screen == SCR_ONLINE_JOIN || (screen == SCR_SETTINGS && settingsFrom == SCR_MENU)) {
             /* menu backdrop: parked car, slow orbit */
             float a;
             menuT += dt;
@@ -4376,14 +4636,19 @@ int sarpbc_main(int argc, char **argv)
             /* near cascade sits a bit ahead of the player, where the camera looks */
             Vector3 look = Vector3Subtract(cam.target, cam.position), focus;
             int k;
+            int mySlot = isOnline ? netClient.localSlot : 0;
+            int activeCars = isOnline ? SARP_MAX_CLIENTS : nCars;
             look.y = 0.0f;
-            focus = Vector3Add(rcars[0].pos, Vector3Scale(Vector3Normalize(look), SHADOW_NEAR_SIZE * 0.25f));
+            focus = Vector3Add(rcars[mySlot].pos, Vector3Scale(Vector3Normalize(look), SHADOW_NEAR_SIZE * 0.25f));
             for (k = 0; k < 2; k++) {
                 Shader keep = ballModel.materials[0].shader;
                 gfx_shadow_begin(k, focus);
                 if (haveArena) arena_render_draw(&ar, 0, &G.depth);
-                for (i = 0; i < nCars; i++)
-                    if (!rcars[i].demolished) car_render_draw(&crs[i], &rcars[i], team[i], i == 0 ? g_set.skin : 0, &G.depth);
+                for (i = 0; i < activeCars; i++) {
+                    if (isOnline && !netClient.players[i].active) continue;
+                    if (!rcars[i].demolished)
+                        car_render_draw(&crs[i], &rcars[i], team[i], i == mySlot ? g_set.skin : (isOnline ? netClient.players[i].skin : 0), &G.depth);
+                }
                 ballModel.materials[0].shader = G.depth;
                 ballModel.transform = QuaternionToMatrix(rball.rot);
                 DrawModel(ballModel, rball.pos, 1.0f, WHITE);
@@ -4414,26 +4679,37 @@ int sarpbc_main(int argc, char **argv)
                     DrawSphere(V3(pads[i].x, 1.6f + 0.3f * sinf((float)GetTime() * 3.0f), pads[i].z), 0.7f, (Color){ 255, 120, 25, 255 });
             EndShaderMode();
             if (!g_set.shadows) {   /* blob shadows only when real shadows are off */
+                int activeCars = isOnline ? SARP_MAX_CLIENTS : nCars;
                 DrawCylinder(V3(rball.pos.x, 0.07f, rball.pos.z), BALL_R * 0.9f, BALL_R * 0.9f, 0.01f, 24, (Color){ 0, 0, 0, 90 });
-                for (i = 0; i < nCars; i++)
+                for (i = 0; i < activeCars; i++) {
+                    if (isOnline && !netClient.players[i].active) continue;
                     if (!rcars[i].demolished)
                         DrawCylinder(V3(rcars[i].pos.x, 0.07f, rcars[i].pos.z), 1.3f, 1.3f, 0.01f, 24, (Color){ 0, 0, 0, 90 });
+                }
             }
 
             gfx_mat(0.60f, 64.0f, 0.25f, 0.05f);
             ballModel.transform = QuaternionToMatrix(rball.rot);
             DrawModel(ballModel, rball.pos, 1.0f, WHITE);
-            for (i = 0; i < nCars; i++)
-                if (!rcars[i].demolished)
-                    car_render_draw(&crs[i], &rcars[i], team[i], i == 0 ? g_set.skin : 0, NULL);
+            {
+                int activeCars = isOnline ? SARP_MAX_CLIENTS : nCars;
+                int mySlot = isOnline ? netClient.localSlot : 0;
+                for (i = 0; i < activeCars; i++) {
+                    if (isOnline && !netClient.players[i].active) continue;
+                    if (!rcars[i].demolished)
+                        car_render_draw(&crs[i], &rcars[i], team[i], i == mySlot ? g_set.skin : (isOnline ? netClient.players[i].skin : 0), NULL);
+                }
+            }
             /* boost flame: additive, no depth writes (the core sits inside the outer cone);
              * team-colored outer plume (blue plasma vs orange fire) and bright white-hot core */
             rlDrawRenderBatchActive();
             rlDisableDepthMask();
             BeginBlendMode(BLEND_ADDITIVE);
             for (j = 0; j < 2; j++) {
+                int activeCars = isOnline ? SARP_MAX_CLIENTS : nCars;
                 gfx_emissive_begin(j == 0 ? 2.5f : 5.5f);
-                for (i = 0; i < nCars; i++) {
+                for (i = 0; i < activeCars; i++) {
+                    if (isOnline && !netClient.players[i].active) continue;
                     Car *c = &rcars[i];
                     if (c->boosting && !c->demolished && screen == SCR_GAME) {
                         float t = (float)GetTime() * 40.0f + (float)i * 1.7f;
@@ -4484,7 +4760,10 @@ int sarpbc_main(int argc, char **argv)
                 EndShaderMode();
             }
         gfx_scene_end();
-        gfx_post(g_set.bloom, screen == SCR_GAME && rcars[0].boosting ? 1.0f : 0.0f);
+        {
+            int mySlot = isOnline ? netClient.localSlot : 0;
+            gfx_post(g_set.bloom, screen == SCR_GAME && rcars[mySlot].boosting ? 1.0f : 0.0f);
+        }
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -4493,22 +4772,41 @@ int sarpbc_main(int argc, char **argv)
         /* --- HUD (in game and behind the pause menu) --------------------- */
         if (screen == SCR_GAME || screen == SCR_PAUSE || (screen == SCR_SETTINGS && settingsFrom == SCR_PAUSE)) {
             int sw = GetScreenWidth(), sh = GetScreenHeight();
-            float speed = Vector3Length(rcars[0].vel);
+            int mySlot = isOnline ? netClient.localSlot : 0;
+            float speed = Vector3Length(rcars[mySlot].vel);
 
             draw_hud_scoreboard(sw, scoreBlue, scoreOrange, matchTime, matchLen, state);
-            draw_hud_boost_and_speed(sw, sh, rcars[0].boost, speed, rcars[0].boosting);
-            draw_hud_tactical_badges(sw, sh, ballCam, CAR_NAMES[g_set.car], MODE_NAMES[g_set.mode], SKILL_NAMES[botSkill], g_set.showFps, g_set.showHints && screen == SCR_GAME);
+            draw_hud_boost_and_speed(sw, sh, rcars[mySlot].boost, speed, rcars[mySlot].boosting);
+            draw_hud_tactical_badges(sw, sh, ballCam,
+                                     CAR_NAMES[isOnline ? netClient.players[mySlot].car_model : g_set.car],
+                                     isOnline ? (team[mySlot] == 0 ? "BLUE TEAM" : "ORANGE TEAM") : MODE_NAMES[g_set.mode],
+                                     isOnline ? "DEDICATED SERVER" : SKILL_NAMES[botSkill],
+                                     g_set.showFps, g_set.showHints && screen == SCR_GAME);
 
-            for (i = 1; i < nCars; i++) {
-                if (rcars[i].demolished) continue;
-                Vector3 above = Vector3Add(rcars[i].pos, V3(0, 2.2f, 0));
-                Vector3 toC = Vector3Subtract(above, cam.position);
-                Vector2 sp;
-                const char *tag = TextFormat("BOT %s", CAR_NAMES[carModel[i] < 0 ? 0 : carModel[i]]);
-                if (Vector3DotProduct(toC, Vector3Subtract(cam.target, cam.position)) <= 0.0f) continue;   /* behind the camera */
-                sp = GetWorldToScreen(above, cam);
-                DrawText(tag, (int)sp.x - MeasureText(tag, 16) / 2, (int)sp.y, 16,
-                         team[i] == 0 ? (Color){ 120, 180, 255, 230 } : (Color){ 255, 170, 90, 230 });
+            if (!isOnline) {
+                for (i = 1; i < nCars; i++) {
+                    if (rcars[i].demolished) continue;
+                    Vector3 above = Vector3Add(rcars[i].pos, V3(0, 2.2f, 0));
+                    Vector3 toC = Vector3Subtract(above, cam.position);
+                    Vector2 sp;
+                    const char *tag = TextFormat("BOT %s", CAR_NAMES[carModel[i] < 0 ? 0 : carModel[i]]);
+                    if (Vector3DotProduct(toC, Vector3Subtract(cam.target, cam.position)) <= 0.0f) continue;   /* behind the camera */
+                    sp = GetWorldToScreen(above, cam);
+                    DrawText(tag, (int)sp.x - MeasureText(tag, 16) / 2, (int)sp.y, 16,
+                             team[i] == 0 ? (Color){ 120, 180, 255, 230 } : (Color){ 255, 170, 90, 230 });
+                }
+            } else {
+                Vector3 cpos[SARP_MAX_CLIENTS];
+                int cdemo[SARP_MAX_CLIENTS];
+                for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+                    cpos[i] = rcars[i].pos;
+                    cdemo[i] = rcars[i].demolished;
+                }
+                net_client_draw_nameplates(&netClient, cpos, team, cdemo, cam);
+                net_client_draw_hud(&netClient, sw, sh);
+                if (IsKeyDown(KEY_TAB)) {
+                    net_client_draw_scoreboard(&netClient, sw, sh);
+                }
             }
 
             if (screen == SCR_GAME) {
@@ -4525,8 +4823,8 @@ int sarpbc_main(int argc, char **argv)
                     DrawText(demoBannerText, sw/2 - bw/2 + 2, by + 10 + 2, 38, (Color){ 0, 0, 0, (unsigned char)(220 * alpha) });
                     DrawText(demoBannerText, sw/2 - bw/2, by + 10, 38, (Color){ demoBannerColor.r, demoBannerColor.g, demoBannerColor.b, (unsigned char)(255 * alpha) });
                 }
-                if (cars[0].demolished) {
-                    const char *respawnMsg = TextFormat("RESPAWNING IN %d...", (int)ceilf(fmaxf(0.01f, cars[0].demoTimer)));
+                if (cars[mySlot].demolished) {
+                    const char *respawnMsg = TextFormat("RESPAWNING IN %d...", (int)ceilf(fmaxf(0.01f, cars[mySlot].demoTimer)));
                     int rw = MeasureText(respawnMsg, 28);
                     int rCardW = rw + 50, rCardH = 44;
                     int rx = sw/2 - rCardW/2, ry = sh/2 - 65;
@@ -4576,17 +4874,18 @@ int sarpbc_main(int argc, char **argv)
         /* --- menus (logic runs here so hit-testing matches what's drawn) -- */
         if (screen != screenAtStart) memset(&nav, 0, sizeof(nav));   /* don't let the key that opened a menu also act in it */
         if (screen == SCR_MENU && shotMode != 3 && shotMode != 4) {
-            MenuItem it[7];
+            MenuItem it[8];
             int sw = GetScreenWidth();
             memset(it, 0, sizeof(it));
-            it[0].label = "PLAY";
-            it[1].label = "CAR";      snprintf(it[1].value, sizeof(it[1].value), "%s", CAR_NAMES[g_set.car]);
-            it[2].label = "SKIN";     snprintf(it[2].value, sizeof(it[2].value), "%s", g_set.skin ? CAR_SKIN_NAMES[g_set.car] : "Team (Default)");
-            it[3].label = "MODE";     snprintf(it[3].value, sizeof(it[3].value), "%s", MODE_NAMES[g_set.mode]);
-            it[4].label = "BOTS";     snprintf(it[4].value, sizeof(it[4].value), "%s", SKILL_NAMES[g_set.botSkill]);
-            it[5].label = "SETTINGS";
-            it[6].label = "QUIT";
-            menu_run("", it, 7, &menuSel, nav, &act, &adj);
+            it[0].label = "LOCAL PLAY";
+            it[1].label = "ONLINE MULTIPLAYER";
+            it[2].label = "CAR";      snprintf(it[2].value, sizeof(it[2].value), "%s", CAR_NAMES[g_set.car]);
+            it[3].label = "SKIN";     snprintf(it[3].value, sizeof(it[3].value), "%s", g_set.skin ? CAR_SKIN_NAMES[g_set.car] : "Team (Default)");
+            it[4].label = "MODE";     snprintf(it[4].value, sizeof(it[4].value), "%s", MODE_NAMES[g_set.mode]);
+            it[5].label = "BOTS";     snprintf(it[5].value, sizeof(it[5].value), "%s", SKILL_NAMES[g_set.botSkill]);
+            it[6].label = "SETTINGS";
+            it[7].label = "QUIT";
+            menu_run("", it, 8, &menuSel, nav, &act, &adj);
             const char *t1 = "SUPERSONIC ACROBATIC";
             const char *t2 = "ROCKET-POWERED BATTLE-CARS";
             const char *t3 = "CHAMPIONSHIP EDITION";
@@ -4598,11 +4897,34 @@ int sarpbc_main(int argc, char **argv)
             DrawText(t2, sw/2 - w2/2 + 2, 102 + 2, 48, (Color){ 0, 0, 0, 200 });
             DrawText(t2, sw/2 - w2/2, 102, 48, (Color){ 255, 140, 25, 255 });
             DrawText(t3, sw/2 - w3/2, 158, 18, (Color){ 180, 215, 255, 230 });
+        } else if (screen == SCR_ONLINE_JOIN) {
+            MenuItem it[6];
+            memset(it, 0, sizeof(it));
+            it[0].label = "SERVER IP";      snprintf(it[0].value, sizeof(it[0].value), "%s", customIpInput);
+            it[1].label = "SERVER PORT";    snprintf(it[1].value, sizeof(it[1].value), "%d", netClient.serverPort);
+            it[2].label = "PLAYER NAME";    snprintf(it[2].value, sizeof(it[2].value), "%s", playerNameInput);
+            it[3].label = "TEAM";           snprintf(it[3].value, sizeof(it[3].value), "%s", prefTeamSel == 0 ? "Blue" : prefTeamSel == 1 ? "Orange" : "Auto-Balance");
+            it[4].label = netClient.state == NET_CONNECTING ? "CONNECTING..." : "CONNECT TO SERVER";
+            it[5].label = "BACK TO MENU";
+            menu_run("ONLINE MULTIPLAYER", it, 6, &onlineSel, nav, &act, &adj);
+
+            int sw = GetScreenWidth(), sh = GetScreenHeight();
+            int stw = MeasureText(netClient.statusMsg, 18);
+            Color statusColor = netClient.statusOk == 2 ? GREEN :
+                                netClient.statusOk == 1 ? YELLOW :
+                                netClient.statusOk == 3 ? RED : GRAY;
+            DrawText(netClient.statusMsg, sw / 2 - stw / 2, sh / 2 + 190, 18, statusColor);
+            DrawText("Tip: Use A/D to cycle presets, or type to edit IP/Name",
+                     sw / 2 - MeasureText("Tip: Use A/D to cycle presets, or type to edit IP/Name", 14) / 2,
+                     sh / 2 + 218, 14, (Color){ 160, 180, 205, 200 });
         } else if (screen == SCR_PAUSE) {
             MenuItem it[5];
             memset(it, 0, sizeof(it));
-            it[0].label = "RESUME"; it[1].label = "RESTART MATCH"; it[2].label = "SETTINGS";
-            it[3].label = "MAIN MENU"; it[4].label = "QUIT GAME";
+            it[0].label = "RESUME";
+            it[1].label = isOnline ? "LEAVE MATCH" : "RESTART MATCH";
+            it[2].label = "SETTINGS";
+            it[3].label = "MAIN MENU";
+            it[4].label = "QUIT GAME";
             menu_run("PAUSED", it, 5, &pauseSel, nav, &act, &adj);
         } else if (screen == SCR_SETTINGS) {
             MenuItem it[13];
@@ -4629,24 +4951,96 @@ int sarpbc_main(int argc, char **argv)
 
         /* --- apply menu actions ------------------------------------------ */
         if (screen == SCR_MENU) {
-            if (act == 0) { NEW_MATCH(); cam.position = Vector3Add(cars[0].pos, V3(-g_set.camDist, 2.0f, 0)); screen = SCR_GAME; }
-            if (menuSel == 1 && adj) {
+            if (act == 0) { isOnline = 0; NEW_MATCH(); cam.position = Vector3Add(cars[0].pos, V3(-g_set.camDist, 2.0f, 0)); screen = SCR_GAME; }
+            if (act == 1) { screen = SCR_ONLINE_JOIN; onlineSel = 4; }
+            if (menuSel == 2 && adj) {
                 int prev = g_set.car;
                 g_set.car = (g_set.car + adj + CAR_COUNT) % CAR_COUNT;
                 if (!load_car(CAR_NAMES[g_set.car], &cars[0], &crs[0], lit, 1)) { g_set.car = prev; load_car(CAR_NAMES[prev], &cars[0], &crs[0], lit, 1); }
                 carModel[0] = g_set.car;
                 settings_save();
             }
-            if (menuSel == 2 && adj) { g_set.skin = (g_set.skin + adj + 2) % 2; settings_save(); }
-            if (menuSel == 3 && adj) { g_set.mode = (g_set.mode + adj + 4) % 4; settings_save(); }
-            if (menuSel == 4 && adj) { g_set.botSkill = (g_set.botSkill + adj + 3) % 3; settings_save(); }
-            if (act == 5) { settingsFrom = SCR_MENU; setSel = 0; screen = SCR_SETTINGS; }
-            if (act == 6) quit = 1;
+            if (menuSel == 3 && adj) { g_set.skin = (g_set.skin + adj + 2) % 2; settings_save(); }
+            if (menuSel == 4 && adj) { g_set.mode = (g_set.mode + adj + 4) % 4; settings_save(); }
+            if (menuSel == 5 && adj) { g_set.botSkill = (g_set.botSkill + adj + 3) % 3; settings_save(); }
+            if (act == 6) { settingsFrom = SCR_MENU; setSel = 0; screen = SCR_SETTINGS; }
+            if (act == 7) quit = 1;
+        } else if (screen == SCR_ONLINE_JOIN) {
+            int key = GetCharPressed();
+            while (key > 0) {
+                if (onlineSel == 0) {
+                    int len = (int)strlen(customIpInput);
+                    if (len < 28 && ((key >= '0' && key <= '9') || key == '.' || key == ':' || (key >= 'a' && key <= 'z'))) {
+                        customIpInput[len] = (char)key; customIpInput[len + 1] = 0;
+                    }
+                } else if (onlineSel == 2) {
+                    int len = (int)strlen(playerNameInput);
+                    if (len < 16 && (key >= 32 && key <= 126)) {
+                        playerNameInput[len] = (char)key; playerNameInput[len + 1] = 0;
+                    }
+                }
+                key = GetCharPressed();
+            }
+            if (IsKeyPressed(KEY_BACKSPACE)) {
+                if (onlineSel == 0 && strlen(customIpInput) > 0) customIpInput[strlen(customIpInput) - 1] = 0;
+                if (onlineSel == 2 && strlen(playerNameInput) > 0) playerNameInput[strlen(playerNameInput) - 1] = 0;
+            }
+
+            if (onlineSel == 0 && adj) {
+                static const char *presets[] = { "127.0.0.1", "192.168.1.100", "10.0.0.1", "localhost" };
+                static int preIdx = 0;
+                preIdx = (preIdx + adj + 4) % 4;
+                strncpy(customIpInput, presets[preIdx], sizeof(customIpInput) - 1);
+            }
+            if (onlineSel == 3 && adj) {
+                prefTeamSel = (prefTeamSel + adj + 3) % 3;
+            }
+
+            if (act == 4 || (onlineSel == 4 && nav.ok)) {
+                net_client_connect(&netClient, customIpInput, netClient.serverPort, playerNameInput, g_set.car, g_set.skin, prefTeamSel);
+            }
+            if (act == 5 || nav.back) {
+                net_client_disconnect(&netClient);
+                screen = SCR_MENU;
+            }
+
+            net_client_poll(&netClient, dt);
+            if (netClient.state == NET_CONNECTED) {
+                isOnline = 1;
+                int mySlot = netClient.localSlot;
+                carModel[mySlot] = g_set.car;
+                team[mySlot] = netClient.localTeam;
+                load_car(CAR_NAMES[g_set.car], &cars[mySlot], &crs[mySlot], lit, 1);
+                for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+                    if (i != mySlot) {
+                        cars[i].pos = V3(0, -500, 0);
+                        carModel[i] = -1;
+                    }
+                }
+                camSnap = 1;
+                screen = SCR_GAME;
+            }
         } else if (screen == SCR_PAUSE) {
             if (act == 0 || nav.back) screen = SCR_GAME;
-            if (act == 1) { NEW_MATCH(); screen = SCR_GAME; }
+            if (act == 1) {
+                if (isOnline) {
+                    net_client_disconnect(&netClient);
+                    isOnline = 0;
+                    screen = SCR_MENU;
+                } else {
+                    NEW_MATCH();
+                    screen = SCR_GAME;
+                }
+            }
             if (act == 2) { settingsFrom = SCR_PAUSE; setSel = 0; screen = SCR_SETTINGS; }
-            if (act == 3) { menuSel = 0; screen = SCR_MENU; }
+            if (act == 3) {
+                if (isOnline) {
+                    net_client_disconnect(&netClient);
+                    isOnline = 0;
+                }
+                menuSel = 0;
+                screen = SCR_MENU;
+            }
             if (act == 4) quit = 1;
         } else if (screen == SCR_SETTINGS) {
             if (adj) {
@@ -4672,6 +5066,11 @@ int sarpbc_main(int argc, char **argv)
 #undef KICKOFF
 #undef NEW_MATCH
 #undef SETUP_CARS
+
+    if (netClient.state == NET_CONNECTED) {
+        net_client_disconnect(&netClient);
+    }
+    net_client_shutdown();
 
     settings_save();
     for (i = 0; i < MAX_CARS; i++) car_render_unload(&crs[i]);

@@ -8,14 +8,14 @@ Push-Location $PSScriptRoot
 try {
     gcc -std=c99 -O2 -Wall -Wextra `
         -I"$raylib\include" -I"..\export_c\include" `
-        src\main.c -o sarpbc.exe `
-        -L"$raylib\lib" -lraylib -lopengl32 -lgdi32 -lwinmm
+        src\main.c src\net_client.c -o sarpbc.exe `
+        -L"$raylib\lib" -lraylib -lopengl32 -lgdi32 -lwinmm -lws2_32
     if ($LASTEXITCODE -ne 0) { throw "build exe failed" }
 
     gcc -std=c99 -O2 -Wall -Wextra -shared -DSARPBC_DLL `
         -I"$raylib\include" -I"..\export_c\include" `
-        src\main.c -o sarpbc_game.dll `
-        -L"$raylib\lib" -lraylib -lopengl32 -lgdi32 -lwinmm
+        src\main.c src\net_client.c -o sarpbc_game.dll `
+        -L"$raylib\lib" -lraylib -lopengl32 -lgdi32 -lwinmm -lws2_32
     if ($LASTEXITCODE -ne 0) { throw "build dll failed" }
 
     Write-Host "built game\sarpbc.exe and game\sarpbc_game.dll"
