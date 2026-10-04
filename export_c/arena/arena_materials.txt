@@ -1,0 +1,7 @@
+Pavement01_Mat Pavement01.tga 255 255 255 255
+StreetLine01_Mat - 235 235 230 255
+SideWalk01_Mat - 150 148 142 255
+GrayTiles01_Mat - 150 152 158 255
+Brick01_Mat Brick01.tga 255 255 255 255
+MetalGarage01_Mat - 105 110 118 255
+material_0 - 150 200 255 50

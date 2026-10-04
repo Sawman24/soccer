@@ -1,0 +1,19 @@
+# SARPBC scarab
+newmtl body
+Kd 1 1 1
+Ns 60
+map_Kd body_blue.tga
+map_Bump body_normal.tga
+
+newmtl glass
+Kd 0.06 0.09 0.16
+Ns 200
+d 0.6
+
+newmtl tire
+Kd 1 1 1
+Ns 10
+map_Kd tire_diffuse.tga
+map_Bump tire_normal.tga
+map_d tire_diffuse.tga
+

@@ -1,0 +1,19 @@
+# Binaries and tools
+tools/w64devkit/
+tools/git/
+tools/umodel/
+PkgExtractor.exe
+PkgExtractor.cs
+
+# Raw PS3 Game Packages and Intermediate Extractions
+*.pkg
+*.rap
+extracted/
+exported_assets/
+UmodelSaved/
+
+# Temporary and Scratch Previews
+*.bmp
+*.log
+.system_generated/
+game/Tech_Ball_D.tga
