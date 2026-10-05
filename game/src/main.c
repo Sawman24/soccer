@@ -78,6 +78,25 @@ static const char *CAR_SKIN_NAMES[] = {
 static const float MATCH_LENGTHS[] = { 180.0f, 300.0f, 600.0f, 0.0f };   /* 0 = unlimited */
 static const char *MATCH_NAMES[]   = { "3 min", "5 min", "10 min", "Unlimited" };
 
+/* Rebindable actions. Each has two keyboard/mouse slots and one controller slot.
+ * Keyboard codes are raylib KEY_* values; mouse buttons are BIND_MOUSE + button.
+ * Controller codes are raylib GAMEPAD_BUTTON_* values (the 2nd triggers read the
+ * analog axis). Steering / air pitch also always follow the left stick. */
+enum {
+    ACT_FORWARD, ACT_REVERSE, ACT_LEFT, ACT_RIGHT, ACT_JUMP, ACT_BOOST, ACT_SLIDE,
+    ACT_ROLL_L, ACT_ROLL_R, ACT_BALLCAM, ACT_SCOREBOARD, ACT_PAUSE, ACT_RESET, ACT_COUNT
+};
+#define BIND_MOUSE 1000
+static const char *ACT_LABELS[ACT_COUNT] = {
+    "Drive Forward / Pitch Down", "Reverse / Pitch Up", "Steer Left", "Steer Right", "Jump / Dodge",
+    "Boost", "Powerslide / Air Roll", "Air Roll Left", "Air Roll Right", "Ball Cam",
+    "Scoreboard", "Pause", "Reset (offline)"
+};
+static const char *ACT_KEYS[ACT_COUNT] = {   /* settings.ini names */
+    "forward", "reverse", "steer_left", "steer_right", "jump", "boost", "powerslide",
+    "roll_left", "roll_right", "ball_cam", "scoreboard", "pause", "reset"
+};
+
 typedef struct Settings {
     float camDist, camHeight, fov;      /* metres, height/distance ratio, vertical degrees */
     int   boostFov, matchIdx, invertPitch, fullscreen, showFps, showHints, car;
@@ -87,8 +106,52 @@ typedef struct Settings {
     char  name[24];                     /* online player name */
     char  server[64];                   /* quick-match server address (host or host:port) */
     int   playlist;                     /* last quick-match playlist: players per team */
+    /* controls */
+    int   kb[ACT_COUNT][2];             /* keyboard / mouse: primary, alternate */
+    int   pad[ACT_COUNT];               /* controller button */
+    float deadzone, dodgeDeadzone;      /* controller stick deadzones (0..1) */
+    float steerSens, aerialSens;        /* stick sensitivity multipliers */
+    int   vibration, padStyle;          /* rumble on/off, 0 = Xbox prompts, 1 = PlayStation */
+    /* camera */
+    int   camShake, ballCamHold;        /* shake on goals/demos; ball cam toggle (0) or hold (1) */
+    float camStiffness, camSwivel;      /* 0..1 how tightly the camera follows; right-stick swivel speed 1..10 */
 } Settings;
-static Settings g_set = { 4.6f, 0.44f, 75.0f, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, "Striker", "127.0.0.1", 2 };
+static Settings g_set = {
+    .camDist = 4.6f, .camHeight = 0.44f, .fov = 75.0f, .boostFov = 1, .matchIdx = 1, .invertPitch = 0, .fullscreen = 0,
+    .showFps = 1, .showHints = 1, .car = 0, .mode = 1, .botSkill = 1, .shadows = 1, .bloom = 1, .skin = 1,
+    .name = "Striker", .server = "127.0.0.1", .playlist = 2
+};   /* controls + camera extras are set by controls_default_*() / camera_defaults() */
+
+static void controls_default_bindings(void)
+{
+    static const int kb[ACT_COUNT][2] = {
+        { KEY_W, KEY_UP }, { KEY_S, KEY_DOWN }, { KEY_A, KEY_LEFT }, { KEY_D, KEY_RIGHT },
+        { KEY_SPACE, BIND_MOUSE + MOUSE_BUTTON_LEFT }, { KEY_LEFT_SHIFT, BIND_MOUSE + MOUSE_BUTTON_RIGHT },
+        { KEY_LEFT_CONTROL, 0 }, { KEY_Q, 0 }, { KEY_E, 0 }, { KEY_C, 0 },
+        { KEY_TAB, 0 }, { KEY_P, 0 }, { KEY_R, 0 }
+    };
+    static const int pad[ACT_COUNT] = {
+        GAMEPAD_BUTTON_RIGHT_TRIGGER_2, GAMEPAD_BUTTON_LEFT_TRIGGER_2, 0, 0,
+        GAMEPAD_BUTTON_RIGHT_FACE_DOWN, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, GAMEPAD_BUTTON_RIGHT_FACE_LEFT,
+        GAMEPAD_BUTTON_LEFT_TRIGGER_1, GAMEPAD_BUTTON_RIGHT_TRIGGER_1, GAMEPAD_BUTTON_RIGHT_FACE_UP,
+        GAMEPAD_BUTTON_MIDDLE_LEFT, GAMEPAD_BUTTON_MIDDLE_RIGHT, GAMEPAD_BUTTON_LEFT_FACE_DOWN
+    };
+    memcpy(g_set.kb, kb, sizeof(kb));
+    memcpy(g_set.pad, pad, sizeof(pad));
+}
+
+static void controls_default_tuning(void)
+{
+    g_set.deadzone = 0.12f; g_set.dodgeDeadzone = 0.35f;
+    g_set.steerSens = 1.0f; g_set.aerialSens = 1.0f;
+    g_set.vibration = 1; g_set.padStyle = 0;
+}
+
+static void camera_defaults(void)
+{
+    g_set.camShake = 1; g_set.ballCamHold = 0;
+    g_set.camStiffness = 0.45f; g_set.camSwivel = 5.0f;
+}
 
 static void settings_path(char *out, size_t n) {
     if (FileExists("settings.ini")) snprintf(out, n, "settings.ini");
@@ -127,6 +190,25 @@ static void settings_load(void)
         else if (!strcmp(key, "skin"))            g_set.skin        = (int)clampf(v, 0, 1);
         else if (!strcmp(key, "playlist"))        g_set.playlist    = (int)clampf(v, 1, 3);
         else if (!strcmp(key, "server"))          snprintf(g_set.server, sizeof(g_set.server), "%s", sv);
+        else if (!strcmp(key, "deadzone"))        g_set.deadzone      = clampf(v, 0.0f, 0.6f);
+        else if (!strcmp(key, "dodge_deadzone"))  g_set.dodgeDeadzone = clampf(v, 0.1f, 0.95f);
+        else if (!strcmp(key, "steer_sens"))      g_set.steerSens     = clampf(v, 0.5f, 3.0f);
+        else if (!strcmp(key, "aerial_sens"))     g_set.aerialSens    = clampf(v, 0.5f, 3.0f);
+        else if (!strcmp(key, "vibration"))       g_set.vibration     = v != 0;
+        else if (!strcmp(key, "pad_style"))       g_set.padStyle      = (int)clampf(v, 0, 1);
+        else if (!strcmp(key, "camera_shake"))    g_set.camShake      = v != 0;
+        else if (!strcmp(key, "ball_cam_hold"))   g_set.ballCamHold   = v != 0;
+        else if (!strcmp(key, "camera_stiffness")) g_set.camStiffness = clampf(v, 0.0f, 1.0f);
+        else if (!strcmp(key, "camera_swivel"))   g_set.camSwivel     = clampf(v, 1.0f, 10.0f);
+        else if (!strncmp(key, "kb_", 3) || !strncmp(key, "pad_", 4)) {
+            int isPad = key[0] == 'p', a, c0 = 0, c1 = 0;
+            const char *nm = key + (isPad ? 4 : 3);
+            for (a = 0; a < ACT_COUNT; a++) {
+                if (strcmp(nm, ACT_KEYS[a])) continue;
+                if (isPad) { if (sscanf(sv, "%d", &c0) == 1 && c0 >= 0 && c0 <= GAMEPAD_BUTTON_RIGHT_THUMB) g_set.pad[a] = c0; }
+                else if (sscanf(sv, "%d,%d", &c0, &c1) >= 1) { g_set.kb[a][0] = c0; g_set.kb[a][1] = c1; }
+            }
+        }
         else if (!strcmp(key, "car"))
             for (i = 0; i < CAR_COUNT; i++) if (!strcmp(sv, CAR_NAMES[i])) g_set.car = i;
     }
@@ -146,60 +228,275 @@ static void settings_save(void)
             g_set.invertPitch, g_set.fullscreen, g_set.showFps, g_set.showHints, CAR_NAMES[g_set.car],
             g_set.mode, g_set.botSkill, g_set.shadows, g_set.bloom, g_set.skin,
             g_set.playlist, g_set.server[0] ? g_set.server : "127.0.0.1", g_set.name);
+    fprintf(f, "deadzone=%.2f\ndodge_deadzone=%.2f\nsteer_sens=%.2f\naerial_sens=%.2f\nvibration=%d\npad_style=%d\n"
+               "camera_shake=%d\nball_cam_hold=%d\ncamera_stiffness=%.2f\ncamera_swivel=%.1f\n",
+            g_set.deadzone, g_set.dodgeDeadzone, g_set.steerSens, g_set.aerialSens, g_set.vibration, g_set.padStyle,
+            g_set.camShake, g_set.ballCamHold, g_set.camStiffness, g_set.camSwivel);
+    for (int a = 0; a < ACT_COUNT; a++)
+        fprintf(f, "kb_%s=%d,%d\npad_%s=%d\n", ACT_KEYS[a], g_set.kb[a][0], g_set.kb[a][1], ACT_KEYS[a], g_set.pad[a]);
     fclose(f);
 }
 
 /* ------------------------------------------------------------------------ */
 /* Input                                                                      */
 /* ------------------------------------------------------------------------ */
+/* Per-frame controller state (call input_poll() once at the top of every frame). */
+static int   g_trigSeen[2];          /* triggers can report 0 until first touched; trust them once seen at rest (-1) */
+static float g_trigNow[2], g_trigPrev[2];   /* 0 = left, 1 = right, 0..1 */
+static int   g_usingPad;             /* last input came from the controller (for button prompts) */
+
+static void input_poll(void)
+{
+    int k;
+    g_trigPrev[0] = g_trigNow[0]; g_trigPrev[1] = g_trigNow[1];
+    g_trigNow[0] = g_trigNow[1] = 0.0f;
+    if (IsGamepadAvailable(0)) {
+        float lt = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_TRIGGER);
+        float rt = GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_TRIGGER);
+        if (lt < -0.5f) g_trigSeen[0] = 1;
+        if (rt < -0.5f) g_trigSeen[1] = 1;
+        g_trigNow[0] = g_trigSeen[0] ? (lt + 1.0f) * 0.5f : (float)IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_TRIGGER_2);
+        g_trigNow[1] = g_trigSeen[1] ? (rt + 1.0f) * 0.5f : (float)IsGamepadButtonDown(0, GAMEPAD_BUTTON_RIGHT_TRIGGER_2);
+        for (k = 1; k <= GAMEPAD_BUTTON_RIGHT_THUMB; k++) if (IsGamepadButtonDown(0, k)) g_usingPad = 1;
+        if (fabsf(GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X)) > 0.5f || fabsf(GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_Y)) > 0.5f ||
+            g_trigNow[0] > 0.5f || g_trigNow[1] > 0.5f) g_usingPad = 1;
+    } else g_usingPad = 0;
+    if (g_usingPad) {
+        Vector2 md = GetMouseDelta();
+        for (k = 0; k < ACT_COUNT; k++)
+            if ((g_set.kb[k][0] > 0 && g_set.kb[k][0] < BIND_MOUSE && IsKeyDown(g_set.kb[k][0])) ||
+                (g_set.kb[k][1] > 0 && g_set.kb[k][1] < BIND_MOUSE && IsKeyDown(g_set.kb[k][1]))) g_usingPad = 0;
+        if (fabsf(md.x) + fabsf(md.y) > 4.0f || IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) g_usingPad = 0;
+    }
+}
+
+static float kb_value(int code)
+{
+    if (code <= 0) return 0.0f;
+    if (code >= BIND_MOUSE) return (float)IsMouseButtonDown(code - BIND_MOUSE);
+    return (float)IsKeyDown(code);
+}
+
+static int kb_pressed(int code)
+{
+    if (code <= 0) return 0;
+    if (code >= BIND_MOUSE) return IsMouseButtonPressed(code - BIND_MOUSE);
+    return IsKeyPressed(code);
+}
+
+static float pad_value(int code)
+{
+    if (code <= 0 || !IsGamepadAvailable(0)) return 0.0f;
+    if (code == GAMEPAD_BUTTON_LEFT_TRIGGER_2)  return g_trigNow[0];
+    if (code == GAMEPAD_BUTTON_RIGHT_TRIGGER_2) return g_trigNow[1];
+    return (float)IsGamepadButtonDown(0, code);
+}
+
+static int pad_pressed(int code)
+{
+    if (code <= 0 || !IsGamepadAvailable(0)) return 0;
+    if (code == GAMEPAD_BUTTON_LEFT_TRIGGER_2)  return g_trigNow[0] > 0.5f && g_trigPrev[0] <= 0.5f;
+    if (code == GAMEPAD_BUTTON_RIGHT_TRIGGER_2) return g_trigNow[1] > 0.5f && g_trigPrev[1] <= 0.5f;
+    return IsGamepadButtonPressed(0, code);
+}
+
+static float act_kb(int a)    { return fmaxf(kb_value(g_set.kb[a][0]), kb_value(g_set.kb[a][1])); }
+static int   act_down(int a)  { return act_kb(a) > 0.5f || pad_value(g_set.pad[a]) > 0.5f; }
+static int   act_pressed(int a) { return kb_pressed(g_set.kb[a][0]) || kb_pressed(g_set.kb[a][1]) || pad_pressed(g_set.pad[a]); }
+
+/* stick deadzone with rescale so output still spans 0..1 */
+static float stick_dz(float v, float dz)
+{
+    float a = fabsf(v);
+    if (a <= dz) return 0.0f;
+    return copysignf(fminf((a - dz) / fmaxf(1.0f - dz, 0.05f), 1.0f), v);
+}
+
 static Input read_input(void)
 {
-    static int trigSeen[2] = { 0, 0 };
     Input in;
-    float kx, ky, roll;
+    float steer, pitch, throttle, roll, mag;
+    float padF = pad_value(g_set.pad[ACT_FORWARD]), padR = pad_value(g_set.pad[ACT_REVERSE]);
+    int stick = 0;
     memset(&in, 0, sizeof(in));
 
-    kx = (float)(IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) - (float)(IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT));
-    ky = (float)(IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN))  - (float)(IsKeyDown(KEY_W) || IsKeyDown(KEY_UP));
-    roll = (float)IsKeyDown(KEY_E) - (float)IsKeyDown(KEY_Q);
-    in.throttle    = -ky;
-    in.steer       = kx;
-    in.pitch       = ky;
-    in.jump        = IsKeyDown(KEY_SPACE) || IsMouseButtonDown(MOUSE_BUTTON_LEFT);
-    in.jumpPressed = IsKeyPressed(KEY_SPACE) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
-    in.boost       = IsKeyDown(KEY_LEFT_SHIFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
-    in.slide       = IsKeyDown(KEY_LEFT_CONTROL);
+    /* keyboard: forward/reverse also pitch in the air (W = nose down) */
+    throttle = act_kb(ACT_FORWARD) - act_kb(ACT_REVERSE);
+    pitch    = -throttle;
+    steer    = fmaxf(act_kb(ACT_RIGHT), pad_value(g_set.pad[ACT_RIGHT])) - fmaxf(act_kb(ACT_LEFT), pad_value(g_set.pad[ACT_LEFT]));
+    roll     = (float)act_down(ACT_ROLL_R) - (float)act_down(ACT_ROLL_L);
+    if (padF > 0.05f || padR > 0.05f) throttle = padF - padR;
 
+    mag = sqrtf(steer * steer + pitch * pitch);
     if (IsGamepadAvailable(0)) {
         float gx = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X);
         float gy = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_Y);
-        float rt = GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_TRIGGER);
-        float lt = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_TRIGGER);
-        /* triggers can report 0 until first touched; only trust them once seen at rest (-1) */
-        if (rt < -0.5f) trigSeen[0] = 1;
-        if (lt < -0.5f) trigSeen[1] = 1;
-        rt = trigSeen[0] ? (rt + 1.0f) * 0.5f : 0.0f;
-        lt = trigSeen[1] ? (lt + 1.0f) * 0.5f : 0.0f;
-        if (fabsf(gx) < 0.12f) gx = 0;
-        if (fabsf(gy) < 0.12f) gy = 0;
-        if (gx != 0) in.steer = gx;
-        if (gy != 0) in.pitch = gy;
-        if (rt > 0.05f || lt > 0.05f) in.throttle = rt - lt;
-        in.jump        |= IsGamepadButtonDown(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
-        in.jumpPressed |= IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
-        in.boost       |= IsGamepadButtonDown(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT);
-        in.slide       |= IsGamepadButtonDown(0, GAMEPAD_BUTTON_RIGHT_FACE_LEFT);
-        if (IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_TRIGGER_1))  roll -= 1.0f;
-        if (IsGamepadButtonDown(0, GAMEPAD_BUTTON_RIGHT_TRIGGER_1)) roll += 1.0f;
+        float sx = stick_dz(gx, g_set.deadzone), sy = stick_dz(gy, g_set.deadzone);
+        if (sx != 0.0f || sy != 0.0f) {
+            stick = 1;
+            if (sx != 0.0f) steer = sx;
+            if (sy != 0.0f) pitch = sy;
+            mag = sqrtf(gx * gx + gy * gy);   /* dodge deadzone uses the raw stick */
+        }
+    }
+    if (g_set.invertPitch) pitch = -pitch;
+
+    in.throttle    = clampf(throttle, -1, 1);
+    in.steer       = clampf(steer * (stick ? g_set.steerSens : 1.0f), -1, 1);
+    in.yaw         = clampf(steer * (stick ? g_set.aerialSens : 1.0f), -1, 1);
+    in.pitch       = clampf(pitch * (stick ? g_set.aerialSens : 1.0f), -1, 1);
+    in.jump        = act_down(ACT_JUMP);
+    in.jumpPressed = act_pressed(ACT_JUMP);
+    in.boost       = act_down(ACT_BOOST);
+    in.slide       = act_down(ACT_SLIDE);
+
+    /* Dodge deadzone: below it a jump press is a double jump, above it always a
+     * dodge (the physics flips when |steer, pitch| > DODGE_DEADZONE). */
+    if (in.jumpPressed) {
+        if (mag < g_set.dodgeDeadzone) { in.steer = in.pitch = in.yaw = 0.0f; }
+        else {
+            float m = sqrtf(in.steer * in.steer + in.pitch * in.pitch);
+            if (m > 1e-3f && m < DODGE_DEADZONE + 0.02f) {
+                float k = (DODGE_DEADZONE + 0.02f) / m;
+                in.steer = clampf(in.steer * k, -1, 1); in.pitch = clampf(in.pitch * k, -1, 1);
+            }
+        }
     }
 
-    if (g_set.invertPitch) in.pitch = -in.pitch;
-
     /* powerslide button doubles as air roll (steer -> roll) */
-    if (in.slide) { in.roll = in.steer; in.yaw = 0.0f; }
-    else          { in.yaw = in.steer; }
+    if (in.slide) { in.roll = in.yaw; in.yaw = 0.0f; }
     if (roll != 0.0f) in.roll = clampf(roll, -1, 1);
     return in;
+}
+
+/* ---- controller rumble (XInput; raylib's GLFW backend has no vibration) ---- */
+#ifdef _WIN32
+typedef struct { unsigned short l, r; } XInVib;
+typedef unsigned long (__stdcall *XInSetStateFn)(unsigned long, XInVib *);
+__declspec(dllimport) void *__stdcall LoadLibraryA(const char *);
+__declspec(dllimport) void *__stdcall GetProcAddress(void *, const char *);
+static XInSetStateFn g_xinSet;
+static int g_xinTried;
+#endif
+static double g_rumbleUntil;
+
+static void rumble(float low, float high, float seconds)
+{
+#ifdef _WIN32
+    XInVib v;
+    if (!g_set.vibration || !IsGamepadAvailable(0)) return;
+    if (!g_xinTried) {
+        void *h = LoadLibraryA("xinput1_4.dll");
+        if (!h) h = LoadLibraryA("xinput9_1_0.dll");
+        if (h) g_xinSet = (XInSetStateFn)GetProcAddress(h, "XInputSetState");
+        g_xinTried = 1;
+    }
+    if (!g_xinSet) return;
+    v.l = (unsigned short)(clampf(low, 0, 1) * 65535.0f);
+    v.r = (unsigned short)(clampf(high, 0, 1) * 65535.0f);
+    g_xinSet(0, &v);
+    g_rumbleUntil = GetTime() + seconds;
+#else
+    (void)low; (void)high; (void)seconds;
+#endif
+}
+
+static void rumble_update(void)
+{
+#ifdef _WIN32
+    if (g_rumbleUntil > 0.0 && (GetTime() >= g_rumbleUntil || !g_set.vibration)) {
+        XInVib v = { 0, 0 };
+        if (g_xinSet) g_xinSet(0, &v);
+        g_rumbleUntil = 0.0;
+    }
+#endif
+}
+
+/* ---- names for bindings (HUD hints + settings) ---------------------------- */
+static const char *key_name(int code)
+{
+    static char bufs[8][12];
+    static int bi;
+    char *buf = bufs[bi++ & 7];   /* rotating buffers: several names can be used in one TextFormat */
+    if (code <= 0) return "-";
+    if (code >= BIND_MOUSE) {
+        switch (code - BIND_MOUSE) {
+        case MOUSE_BUTTON_LEFT: return "MOUSE L";
+        case MOUSE_BUTTON_RIGHT: return "MOUSE R";
+        case MOUSE_BUTTON_MIDDLE: return "MOUSE M";
+        case MOUSE_BUTTON_SIDE: return "MOUSE 4";
+        case MOUSE_BUTTON_EXTRA: return "MOUSE 5";
+        case MOUSE_BUTTON_FORWARD: return "MOUSE FWD";
+        case MOUSE_BUTTON_BACK: return "MOUSE BACK";
+        default: return "MOUSE";
+        }
+    }
+    if ((code >= KEY_A && code <= KEY_Z) || (code >= KEY_ZERO && code <= KEY_NINE)) { buf[0] = (char)code; buf[1] = 0; return buf; }
+    if (code >= KEY_F1 && code <= KEY_F12) { snprintf(buf, 12, "F%d", code - KEY_F1 + 1); return buf; }
+    if (code >= KEY_KP_0 && code <= KEY_KP_9) { snprintf(buf, 12, "NUM %d", code - KEY_KP_0); return buf; }
+    switch (code) {
+    case KEY_SPACE: return "SPACE";          case KEY_ESCAPE: return "ESC";
+    case KEY_ENTER: return "ENTER";          case KEY_TAB: return "TAB";
+    case KEY_BACKSPACE: return "BKSP";       case KEY_INSERT: return "INS";
+    case KEY_DELETE: return "DEL";           case KEY_RIGHT: return "RIGHT";
+    case KEY_LEFT: return "LEFT";            case KEY_DOWN: return "DOWN";
+    case KEY_UP: return "UP";                case KEY_PAGE_UP: return "PG UP";
+    case KEY_PAGE_DOWN: return "PG DN";      case KEY_HOME: return "HOME";
+    case KEY_END: return "END";              case KEY_CAPS_LOCK: return "CAPS";
+    case KEY_LEFT_SHIFT: return "L SHIFT";   case KEY_RIGHT_SHIFT: return "R SHIFT";
+    case KEY_LEFT_CONTROL: return "L CTRL";  case KEY_RIGHT_CONTROL: return "R CTRL";
+    case KEY_LEFT_ALT: return "L ALT";       case KEY_RIGHT_ALT: return "R ALT";
+    case KEY_APOSTROPHE: return "'";         case KEY_COMMA: return ",";
+    case KEY_MINUS: return "-";              case KEY_PERIOD: return ".";
+    case KEY_SLASH: return "/";              case KEY_SEMICOLON: return ";";
+    case KEY_EQUAL: return "=";              case KEY_LEFT_BRACKET: return "[";
+    case KEY_BACKSLASH: return "\\";         case KEY_RIGHT_BRACKET: return "]";
+    case KEY_GRAVE: return "`";              case KEY_KP_ENTER: return "NUM ENT";
+    case KEY_KP_ADD: return "NUM +";         case KEY_KP_SUBTRACT: return "NUM -";
+    case KEY_KP_MULTIPLY: return "NUM *";    case KEY_KP_DIVIDE: return "NUM /";
+    case KEY_KP_DECIMAL: return "NUM .";
+    default: snprintf(buf, 12, "K%d", code); return buf;
+    }
+}
+
+/* style 0 = Xbox, 1 = PlayStation */
+static const char *pad_name(int code, int style)
+{
+    static const char *xb[] = { "-", "D-UP", "D-RIGHT", "D-DOWN", "D-LEFT", "Y", "B", "A", "X",
+                                "LB", "LT", "RB", "RT", "VIEW", "HOME", "MENU", "LS", "RS" };
+    static const char *ps[] = { "-", "D-UP", "D-RIGHT", "D-DOWN", "D-LEFT", "TRIANGLE", "CIRCLE", "CROSS", "SQUARE",
+                                "L1", "L2", "R1", "R2", "SHARE", "PS", "OPTIONS", "L3", "R3" };
+    if (code < 0 || code > GAMEPAD_BUTTON_RIGHT_THUMB) return "?";
+    return style ? ps[code] : xb[code];
+}
+
+/* Bind `code` to (action, slot). Slots 0/1 = keyboard/mouse, 2 = controller.
+ * A code already used by another action moves over (that action gets this
+ * one's old binding, RL-style swap); code 0 clears the slot. */
+static void bind_assign(int a, int slot, int code)
+{
+    int b, s;
+    if (slot < 2) {
+        int old = g_set.kb[a][slot];
+        if (code > 0)
+            for (b = 0; b < ACT_COUNT; b++)
+                for (s = 0; s < 2; s++)
+                    if ((b != a || s != slot) && g_set.kb[b][s] == code) g_set.kb[b][s] = b == a ? 0 : old;
+        g_set.kb[a][slot] = code;
+    } else {
+        int old = g_set.pad[a];
+        if (code > 0)
+            for (b = 0; b < ACT_COUNT; b++)
+                if (b != a && g_set.pad[b] == code) g_set.pad[b] = old;
+        g_set.pad[a] = code;
+    }
+}
+
+/* short prompt for an action, for the device currently in use */
+static const char *act_prompt(int a)
+{
+    if (g_usingPad && g_set.pad[a] > 0) return pad_name(g_set.pad[a], g_set.padStyle);
+    return key_name(g_set.kb[a][0] > 0 ? g_set.kb[a][0] : g_set.kb[a][1]);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2055,7 +2352,6 @@ static Nav read_nav(void)
     return n;
 }
 
-typedef struct MenuItem { const char *label; char value[48]; } MenuItem;
 
 /* Procedural authentic SARPBC high-tech soccer ball texture (1024x512 equirectangular) */
 static Texture2D make_tech_ball_texture(void)
@@ -2381,88 +2677,15 @@ static void draw_hud_tactical_badges(int sw, int sh, int ballCam, const char *ca
 
     /* Keybind hint bar */
     if (showHints) {
-        DrawText("W/S Drive   A/D Steer   SPACE Jump/Dodge   SHIFT Boost   CTRL Slide/Roll   C Ball Cam   ESC Menu",
-                 18, sh - 26, 15, (Color){ 175, 185, 200, 190 });
+        const char *hint = g_usingPad
+            ? TextFormat("%s/%s Drive   L-STICK Steer   %s Jump/Dodge   %s Boost   %s Slide/Roll   %s Ball Cam   %s Menu",
+                         act_prompt(ACT_FORWARD), act_prompt(ACT_REVERSE), act_prompt(ACT_JUMP), act_prompt(ACT_BOOST),
+                         act_prompt(ACT_SLIDE), act_prompt(ACT_BALLCAM), act_prompt(ACT_PAUSE))
+            : TextFormat("%s/%s Drive   %s/%s Steer   %s Jump/Dodge   %s Boost   %s Slide/Roll   %s Ball Cam   ESC Menu",
+                         act_prompt(ACT_FORWARD), act_prompt(ACT_REVERSE), act_prompt(ACT_LEFT), act_prompt(ACT_RIGHT),
+                         act_prompt(ACT_JUMP), act_prompt(ACT_BOOST), act_prompt(ACT_SLIDE), act_prompt(ACT_BALLCAM));
+        DrawText(hint, 18, sh - 26, 15, (Color){ 175, 185, 200, 190 });
     }
-}
-
-/* Draws a modernized frosted-glass vertical menu card */
-static void menu_run(const char *title, MenuItem *it, int n, int *sel, Nav nav, int *act, int *adj)
-{
-    static Vector2 lastMouse = { -1, -1 };
-    const int rowH = n > 11 ? 40 : 48;
-    const int cardW = 540;
-    const int cardH = n * rowH + (title[0] ? 100 : 50);
-    const int fs = n > 11 ? 22 : 25;
-    int sw = GetScreenWidth(), sh = GetScreenHeight();
-    int cardX = sw / 2 - cardW / 2;
-    int cardY = sh / 2 - cardH / 2 + (title[0] ? 15 : 45);
-    int startY = cardY + (title[0] ? 80 : 25);
-    Vector2 m = GetMousePosition();
-    int moved = m.x != lastMouse.x || m.y != lastMouse.y;
-    lastMouse = m;
-
-    *act = -1; *adj = 0;
-    if (nav.up)    *sel = (*sel + n - 1) % n;
-    if (nav.down)  *sel = (*sel + 1) % n;
-    if (nav.left)  *adj = -1;
-    if (nav.right) *adj = 1;
-    if (nav.ok) { if (it[*sel].value[0]) *adj = 1; else *act = *sel; }
-
-    /* Screen dim overlay */
-    DrawRectangle(0, 0, sw, sh, (Color){ 0, 0, 0, 130 });
-
-    /* Card background shadow */
-    DrawRectangleRounded((Rectangle){ (float)cardX + 4, (float)cardY + 6, (float)cardW, (float)cardH }, 0.08f, 6, (Color){ 0, 0, 0, 160 });
-
-    /* Frosted glass card */
-    DrawRectangleRounded((Rectangle){ (float)cardX, (float)cardY, (float)cardW, (float)cardH }, 0.08f, 6, (Color){ 12, 16, 26, 235 });
-    DrawRectangleRoundedLinesEx((Rectangle){ (float)cardX, (float)cardY, (float)cardW, (float)cardH }, 0.08f, 6, 2.0f, (Color){ 45, 75, 120, 220 });
-
-    /* Title at top of card */
-    if (title[0]) {
-        int tw = MeasureText(title, 36);
-        DrawText(title, cardX + cardW / 2 - tw / 2, cardY + 24, 36, (Color){ 255, 185, 50, 255 });
-        DrawRectangle(cardX + 50, cardY + 66, cardW - 100, 2, (Color){ 255, 160, 40, 160 });
-    }
-
-    /* Menu items */
-    for (int i = 0; i < n; i++) {
-        Rectangle r = { (float)(cardX + 24), (float)(startY + i * rowH), (float)(cardW - 48), (float)(rowH - 6) };
-        int hover = CheckCollisionPointRec(m, r);
-        if (hover && moved) *sel = i;
-        if (hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            *sel = i;
-            if (it[i].value[0]) *adj = 1; else *act = i;
-        }
-        if (hover && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && it[i].value[0]) {
-            *sel = i; *adj = -1;
-        }
-        int on = (i == *sel);
-
-        if (on) {
-            DrawRectangleRounded(r, 0.28f, 6, (Color){ 255, 140, 25, 240 });
-            DrawRectangleRoundedLinesEx(r, 0.28f, 6, 1.5f, (Color){ 255, 210, 100, 255 });
-            DrawText(">", (int)r.x + 14, (int)r.y + (rowH - 6)/2 - fs/2 + 2, fs, BLACK);
-            DrawText(it[i].label, (int)r.x + 36, (int)r.y + (rowH - 6)/2 - fs/2 + 2, fs, BLACK);
-        } else {
-            DrawRectangleRounded(r, 0.28f, 6, hover ? (Color){ 32, 42, 60, 220 } : (Color){ 18, 24, 36, 180 });
-            DrawRectangleRoundedLinesEx(r, 0.28f, 6, 1.0f, (Color){ 38, 52, 75, 160 });
-            DrawText(it[i].label, (int)r.x + 24, (int)r.y + (rowH - 6)/2 - fs/2 + 2, fs, (Color){ 220, 228, 240, 255 });
-        }
-
-        if (it[i].value[0]) {
-            const char *valStr = TextFormat("<  %s  >", it[i].value);
-            int vw = MeasureText(valStr, fs - 2);
-            DrawText(valStr, (int)(r.x + r.width - 18 - vw), (int)r.y + (rowH - 6)/2 - (fs - 2)/2 + 2, fs - 2,
-                     on ? (Color){ 20, 20, 20, 255 } : (Color){ 255, 180, 80, 255 });
-        }
-    }
-
-    /* Footer navigation hints */
-    DrawText("ENTER / A  Select    < / >  Adjust    ESC / B  Back",
-             sw / 2 - MeasureText("ENTER / A  Select    < / >  Adjust    ESC / B  Back", 16) / 2,
-             sh - 36, 16, (Color){ 180, 195, 215, 220 });
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2470,7 +2693,7 @@ static void menu_run(const char *title, MenuItem *it, int n, int *sel, Nav nav, 
 /* gamepad focus that moves spatially (up/down/left/right picks the nearest   */
 /* widget in that direction, using last frame's layout).                      */
 /* ------------------------------------------------------------------------ */
-#define UI_MAX 48
+#define UI_MAX 96
 enum { UIK_BUTTON = 0, UIK_SPINNER, UIK_TEXT };
 
 typedef struct UiState {
@@ -2483,6 +2706,7 @@ typedef struct UiState {
     float     t;
 } UiState;
 static UiState g_ui = { .screen = -1 };
+static Rectangle g_uiClip;   /* when width > 0, widgets only take mouse hover/clicks inside it (scroll views) */
 
 #define UI_ACCENT      (Color){ 255, 150, 30, 255 }
 #define UI_ACCENT_HI   (Color){ 255, 214, 110, 255 }
@@ -2549,7 +2773,7 @@ static int ui_add(Rectangle r, int kind)
 {
     Vector2 m = GetMousePosition();
     int id = g_ui.count < UI_MAX ? g_ui.count++ : UI_MAX - 1;
-    int hover = CheckCollisionPointRec(m, r);
+    int hover = CheckCollisionPointRec(m, r) && (g_uiClip.width <= 0 || CheckCollisionPointRec(m, g_uiClip));
     g_ui.rect[id] = r;
     g_ui.kind[id] = kind;
     if (hover && g_ui.mouseMoved) g_ui.focus = id;
@@ -2725,6 +2949,118 @@ static void ui_spinner_anim(Vector2 c, float r, float t)
         float a0 = t * 240.0f + k * 120.0f;
         DrawRing(c, r - 6, r, a0, a0 + 50.0f, 16, k == 0 ? UI_ACCENT : k == 1 ? UI_BLUE : UI_ORANGE);
     }
+}
+
+/* ---- binding glyphs: keycaps and controller buttons ----------------------- */
+static float draw_keycap(const char *t, float cx, float cy, float h, int dim)
+{
+    int fs = (int)fmaxf(13.0f, h * 0.52f);
+    float w = fmaxf(h, (float)MeasureText(t, fs) + h * 0.7f);
+    Rectangle r = { cx - w * 0.5f, cy - h * 0.5f, w, h };
+    DrawRectangleRounded((Rectangle){ r.x, r.y + 3, r.width, r.height }, 0.3f, 6, (Color){ 0, 0, 0, 140 });
+    DrawRectangleRounded(r, 0.3f, 6, dim ? (Color){ 30, 36, 48, 255 } : (Color){ 48, 56, 72, 255 });
+    DrawRectangleRounded((Rectangle){ r.x + 3, r.y + 2, r.width - 6, r.height - 8 }, 0.3f, 6, dim ? (Color){ 38, 46, 60, 255 } : (Color){ 70, 80, 100, 255 });
+    DrawText(t, (int)(cx - MeasureText(t, fs) * 0.5f), (int)(cy - fs * 0.5f - 2), fs, dim ? UI_TEXT_DIM : RAYWHITE);
+    return w;
+}
+
+static void draw_pad_glyph(int code, float cx, float cy, float s, int style)
+{
+    Color dark = (Color){ 22, 26, 34, 255 };
+    const char *nm = pad_name(code, style);
+    if (code >= GAMEPAD_BUTTON_RIGHT_FACE_UP && code <= GAMEPAD_BUTTON_RIGHT_FACE_LEFT) {
+        if (!style) {   /* Xbox: coloured letter discs */
+            static const Color xc[4] = { { 236, 190, 30, 255 }, { 220, 60, 60, 255 }, { 80, 180, 70, 255 }, { 50, 120, 230, 255 } };
+            Color c = xc[code - GAMEPAD_BUTTON_RIGHT_FACE_UP];
+            int fs = (int)(s * 1.1f);
+            DrawCircle((int)cx, (int)cy + 2, s, (Color){ 0, 0, 0, 140 });
+            DrawCircle((int)cx, (int)cy, s, dark);
+            DrawCircleLines((int)cx, (int)cy, s, c);
+            DrawText(nm, (int)(cx - MeasureText(nm, fs) * 0.5f), (int)(cy - fs * 0.5f), fs, c);
+        } else {        /* PlayStation: shapes */
+            float k = s * 0.48f;
+            DrawCircle((int)cx, (int)cy + 2, s, (Color){ 0, 0, 0, 140 });
+            DrawCircle((int)cx, (int)cy, s, dark);
+            switch (code) {
+            case GAMEPAD_BUTTON_RIGHT_FACE_DOWN:
+                DrawLineEx((Vector2){ cx - k, cy - k }, (Vector2){ cx + k, cy + k }, 2.5f, (Color){ 130, 175, 255, 255 });
+                DrawLineEx((Vector2){ cx + k, cy - k }, (Vector2){ cx - k, cy + k }, 2.5f, (Color){ 130, 175, 255, 255 });
+                break;
+            case GAMEPAD_BUTTON_RIGHT_FACE_RIGHT:
+                DrawRing((Vector2){ cx, cy }, k - 1.5f, k + 1.0f, 0, 360, 24, (Color){ 240, 90, 100, 255 });
+                break;
+            case GAMEPAD_BUTTON_RIGHT_FACE_LEFT:
+                DrawRectangleLinesEx((Rectangle){ cx - k, cy - k, 2 * k, 2 * k }, 2.5f, (Color){ 235, 130, 210, 255 });
+                break;
+            default: {
+                Vector2 a = { cx, cy - k * 1.1f }, b = { cx - k * 1.05f, cy + k * 0.75f }, c = { cx + k * 1.05f, cy + k * 0.75f };
+                Color g = (Color){ 70, 210, 170, 255 };
+                DrawLineEx(a, b, 2.5f, g); DrawLineEx(b, c, 2.5f, g); DrawLineEx(c, a, 2.5f, g);
+            } break;
+            }
+        }
+        return;
+    }
+    if (code >= GAMEPAD_BUTTON_LEFT_FACE_UP && code <= GAMEPAD_BUTTON_LEFT_FACE_LEFT) {   /* d-pad cross, lit arm */
+        float a = s * 0.42f, L = s * 1.05f;
+        Color lit = UI_ACCENT, base = (Color){ 60, 68, 84, 255 };
+        DrawRectangleRec((Rectangle){ cx - a, cy - L, 2 * a, 2 * L }, base);
+        DrawRectangleRec((Rectangle){ cx - L, cy - a, 2 * L, 2 * a }, base);
+        switch (code) {
+        case GAMEPAD_BUTTON_LEFT_FACE_UP:    DrawRectangleRec((Rectangle){ cx - a, cy - L, 2 * a, L - a }, lit); break;
+        case GAMEPAD_BUTTON_LEFT_FACE_DOWN:  DrawRectangleRec((Rectangle){ cx - a, cy + a, 2 * a, L - a }, lit); break;
+        case GAMEPAD_BUTTON_LEFT_FACE_LEFT:  DrawRectangleRec((Rectangle){ cx - L, cy - a, L - a, 2 * a }, lit); break;
+        default:                             DrawRectangleRec((Rectangle){ cx + a, cy - a, L - a, 2 * a }, lit); break;
+        }
+        return;
+    }
+    {   /* shoulders, triggers, centre buttons, sticks: labelled pills */
+        int fs = (int)(s * 0.9f);
+        int trig = code == GAMEPAD_BUTTON_LEFT_TRIGGER_2 || code == GAMEPAD_BUTTON_RIGHT_TRIGGER_2;
+        int stick = code == GAMEPAD_BUTTON_LEFT_THUMB || code == GAMEPAD_BUTTON_RIGHT_THUMB;
+        float w = fmaxf(s * 2.4f, (float)MeasureText(nm, fs) + s);
+        Rectangle r = { cx - w * 0.5f, cy - s * 0.8f, w, s * 1.6f };
+        if (stick) { DrawCircle((int)cx, (int)cy, s, dark); DrawCircleLines((int)cx, (int)cy, s, (Color){ 120, 130, 150, 255 }); }
+        else {
+            DrawRectangleRounded((Rectangle){ r.x, r.y + 2, r.width, r.height }, trig ? 0.35f : 0.8f, 6, (Color){ 0, 0, 0, 140 });
+            DrawRectangleRounded(r, trig ? 0.35f : 0.8f, 6, dark);
+            DrawRectangleRoundedLinesEx(r, trig ? 0.35f : 0.8f, 6, 1.5f, (Color){ 120, 130, 150, 255 });
+        }
+        DrawText(nm, (int)(cx - MeasureText(nm, fs) * 0.5f), (int)(cy - fs * 0.5f), fs, RAYWHITE);
+    }
+}
+
+/* One cell of the bindings table. Returns 1 when activated (start listening). */
+static int ui_bindcell(Rectangle r, int isPad, int code, int listening, const char *empty)
+{
+    int id = ui_add(r, UIK_BUTTON), on = id == g_ui.focus;
+    float cx = r.x + r.width * 0.5f, cy = r.y + r.height * 0.5f;
+    DrawRectangleRounded(r, 0.25f, 6, on ? (Color){ 44, 52, 70, 245 } : (Color){ 16, 22, 34, 210 });
+    DrawRectangleRoundedLinesEx(r, 0.25f, 6, on ? 2.5f : 1.0f, on ? UI_ACCENT_HI : (Color){ 40, 56, 82, 160 });
+    if (listening) {
+        float p = 0.5f + 0.5f * sinf(g_ui.t * 8.0f);
+        DrawRectangleRoundedLinesEx(r, 0.25f, 6, 3.0f, ColorAlpha(UI_ACCENT, 0.4f + 0.6f * p));
+        ui_text_c(isPad ? "PRESS BUTTON" : "PRESS KEY", cx, (int)cy - 8, 16, UI_ACCENT_HI);
+    } else if (code <= 0) {
+        DrawText(empty, (int)(cx - MeasureText(empty, 15) * 0.5f), (int)cy - 7, 15, UI_TEXT_DIM);
+    } else if (isPad) {
+        draw_pad_glyph(code, cx, cy, r.height * 0.32f, g_set.padStyle);
+    } else {
+        draw_keycap(key_name(code), cx, cy, r.height * 0.8f, 0);
+    }
+    return g_ui.activated == id;
+}
+
+/* Small labelled tab button for the settings header. */
+static int ui_tab(Rectangle r, const char *label, int selected)
+{
+    int id = ui_add(r, UIK_BUTTON), on = id == g_ui.focus;
+    Color c = selected ? UI_ACCENT_HI : on ? UI_TEXT : UI_TEXT_DIM;
+    if (on || selected) DrawRectangleRounded(r, 0.3f, 6, selected ? (Color){ 30, 38, 56, 235 } : (Color){ 22, 28, 42, 220 });
+    if (on) DrawRectangleRoundedLinesEx(r, 0.3f, 6, 2.0f, UI_ACCENT_HI);
+    ui_text_c(label, r.x + r.width * 0.5f, (int)(r.y + r.height * 0.5f - 11), 22, c);
+    if (selected) DrawRectangle((int)(r.x + 16), (int)(r.y + r.height - 5), (int)(r.width - 32), 4, UI_ACCENT);
+    return g_ui.activated == id;
 }
 
 /* "host", "host:port" -> host + port (default port when missing). */
@@ -3077,7 +3413,7 @@ int sarpbc_main(int argc, char **argv)
     float matchLen = MATCH_TIME, matchTime = MATCH_TIME, stateTimer = 3.0f, acc = 0.0f, fov = 60.0f, menuT = 0.0f;
     GameState state = ST_COUNTDOWN;
     Screen screen = SCR_MENU, settingsFrom = SCR_MENU;
-    int setSel = 0, quit = 0;
+    int quit = 0;
     Input in = { 0 };
     int pendingJump = 0, testMode = 0, shotMode = 0, frameNo = 0;
     /* render interpolation + camera state */
@@ -3116,6 +3452,7 @@ int sarpbc_main(int argc, char **argv)
         else if (strncmp(argv[i], "--", 2) != 0) carArg = argv[i];
     }
 
+    controls_default_bindings(); controls_default_tuning(); camera_defaults();
     if (!testMode) settings_load();
     if (connectArg) snprintf(g_set.server, sizeof(g_set.server), "%s", connectArg);
     if (nameArg) snprintf(g_set.name, sizeof(g_set.name), "%.19s", nameArg);
@@ -3215,6 +3552,12 @@ int sarpbc_main(int argc, char **argv)
     float camShake = 0.0f;
     float matchFoundTimer = 0.0f;       /* "MATCH FOUND" banner after joining a quick match */
     int carAdj = 0;                     /* garage car change, applied after drawing */
+    int setTab = 0;                     /* settings: 0 controls, 1 camera, 2 video, 3 gameplay */
+    int bindAct = -1, bindSlot = 0;     /* settings: action + slot (0/1 keyboard, 2 controller) waiting for input */
+    float bindTimer = 0.0f, setScroll = 0.0f;
+    float camSwivel = 0.0f;             /* right-stick camera swivel (radians) */
+    float prevShake = 0.0f;             /* for rumble when the camera shake kicks in */
+    float dodgeSteer = 0.0f, dodgePitch = 0.0f;   /* stick direction captured with the jump press */
 
     NEW_MATCH();
     for (i = 0; i < MAX_CARS; i++) rcars[i] = cars[i];
@@ -3239,12 +3582,16 @@ int sarpbc_main(int argc, char **argv)
 
     enum { UA_NONE, UA_GO_MENU, UA_GO_PLAY, UA_GO_ONLINE, UA_GO_OFFLINE, UA_GO_GARAGE, UA_GO_SETTINGS, UA_QUIT,
            UA_FIND_MATCH, UA_CANCEL_SEARCH, UA_START_OFFLINE, UA_RESUME, UA_PAUSE_SETTINGS, UA_RESTART,
-           UA_LEAVE_MATCH, UA_REQUEUE, UA_POST_MENU };
+           UA_LEAVE_MATCH, UA_REQUEUE, UA_POST_MENU, UA_SETTINGS_BACK };
     while (!quit && !WindowShouldClose()) {
         float dt = fminf(GetFrameTime(), 0.1f);
         Screen screenAtStart = screen;
-        Nav nav = read_nav();
-        int act = -1, adj = 0, uiAct = UA_NONE;
+        Nav nav;
+        int uiAct = UA_NONE;
+        input_poll();
+        rumble_update();
+        nav = read_nav();
+        if (bindAct >= 0) memset(&nav, 0, sizeof(nav));   /* the rebinding prompt owns all input */
 
         /* ================= game update ================= */
         g_navTextMode = 0;   /* re-armed by ui_end() if a text box still has focus */
@@ -3345,8 +3692,7 @@ int sarpbc_main(int argc, char **argv)
             if (demoBannerTimer > 0.0f) demoBannerTimer -= dt;
             if (camShake > 0.0f) camShake = fmaxf(0.0f, camShake - 2.5f * dt);
 
-            if (screen == SCR_GAME && (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_P) ||
-                (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT)))) {
+            if (screen == SCR_GAME && (IsKeyPressed(KEY_ESCAPE) || act_pressed(ACT_PAUSE))) {   /* ESC always pauses */
                 screen = SCR_PAUSE;
             }
             if (shotMode) {
@@ -3361,15 +3707,19 @@ int sarpbc_main(int argc, char **argv)
             /* (online: paused players keep simulating with neutral input) */
             frozen = state == ST_COUNTDOWN || state == ST_OVER || screen != SCR_GAME;
 
-            if (screen == SCR_GAME && (IsKeyPressed(KEY_C) || (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_UP))))
-                ballCam = !ballCam;
-            if (IsKeyPressed(KEY_R) || (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_LEFT))) {
+            if (screen == SCR_GAME) {
+                if (g_set.ballCamHold) ballCam = act_down(ACT_BALLCAM);
+                else if (act_pressed(ACT_BALLCAM)) ballCam = !ballCam;
+            }
+            if (screen == SCR_GAME && act_pressed(ACT_RESET)) {
                 if (!isOnline) {
                     if (state == ST_OVER) NEW_MATCH(); else KICKOFF();
                 }
             }
 
-            /* edge-triggered input must survive frames with zero physics ticks */
+            /* edge-triggered input must survive frames with zero physics ticks; the
+             * stick direction is captured with it so the dodge goes where it was aimed */
+            if (frame.jumpPressed) { dodgeSteer = frame.steer; dodgePitch = frame.pitch; }
             pendingJump |= frame.jumpPressed;
             in = frame;
             if (frozen) { memset(&in, 0, sizeof(in)); pendingJump = 0; }
@@ -3384,6 +3734,7 @@ int sarpbc_main(int argc, char **argv)
                 for (i = 0; i < activeCars; i++) { prevPos[i] = cars[i].pos; prevRot[i] = cars[i].rot; }
                 prevBallPos = ball.pos; prevBallRot = ball.rot;
                 tick.jumpPressed = pendingJump;
+                if (pendingJump) { tick.steer = dodgeSteer; tick.pitch = dodgePitch; }
                 pendingJump = 0;
                 if (isOnline) {
                     /* simulate with exactly what the server will receive (bit-identical) */
@@ -3425,6 +3776,7 @@ int sarpbc_main(int argc, char **argv)
                         Vector3 prevBVel = ball.vel;
                         if (car_ball_collide(&cars[i], &ball)) {
                             float hitDelta = Vector3Distance(ball.vel, prevBVel);
+                            if (i == 0 && hitDelta > 3.0f) rumble(0.15f + hitDelta * 0.01f, 0.3f + hitDelta * 0.012f, 0.12f);
                             if (hitDelta > 3.0f) {
                                 Vector3 hitPoint = Vector3Lerp(cars[i].pos, ball.pos, 0.5f);
                                 Vector3 hitNorm = Vector3Normalize(Vector3Subtract(ball.pos, cars[i].pos));
@@ -3576,7 +3928,8 @@ int sarpbc_main(int argc, char **argv)
                 int mySlot = isOnline ? netClient.localSlot : 0;
                 const Car *pc = &rcars[mySlot];
                 Vector3 f = car_fwd(pc), dirv, want, look;
-                float kd = 1.0f - expf(-8.0f * dt);
+                float kd = 1.0f - expf(-(3.0f + 11.0f * g_set.camStiffness) * dt);   /* stiffness 0.45 = classic 8/s */
+                float swv = 0.0f;
                 if (IsKeyDown(KEY_LEFT_BRACKET))  g_set.camDist = fmaxf(3.0f,  g_set.camDist - 4.0f * dt);
                 if (IsKeyDown(KEY_RIGHT_BRACKET)) g_set.camDist = fminf(14.0f, g_set.camDist + 4.0f * dt);
                 if (ballCam) { dirv = Vector3Subtract(rball.pos, pc->pos); }
@@ -3584,9 +3937,17 @@ int sarpbc_main(int argc, char **argv)
                 dirv.y = 0.0f;
                 if (Vector3Length(dirv) < 0.01f) dirv = V3(0, 0, 1);
                 dirv = Vector3Normalize(dirv);
+                /* right stick swivels the camera around the car (look left/right/behind) */
+                if (IsGamepadAvailable(0)) {
+                    float rx = stick_dz(GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_X), 0.2f);
+                    float ry = stick_dz(GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_Y), 0.2f);
+                    swv = ry > 0.6f && fabsf(rx) < 0.5f ? PI : rx * PI * 0.75f;   /* stick down = look behind */
+                }
+                camSwivel = Lerp(camSwivel, swv, 1.0f - expf(-g_set.camSwivel * 2.0f * dt));
+                if (fabsf(camSwivel) > 0.01f) dirv = Vector3RotateByAxisAngle(dirv, V3(0, 1, 0), -camSwivel);
                 /* only the heading is smoothed; the distance to the car stays fixed */
                 if (Vector3Length(camDir) < 0.5f || camSnap) { camDir = dirv; camY = pc->pos.y; camSnap = 0; }
-                camDir = Vector3Normalize(Vector3Lerp(camDir, dirv, kd));
+                camDir = Vector3Normalize(Vector3Lerp(camDir, dirv, fabsf(camSwivel) > 0.01f ? fmaxf(kd, 1.0f - expf(-14.0f * dt)) : kd));
                 camY = Lerp(camY, pc->pos.y, 1.0f - expf(-12.0f * dt));   /* soften jump/landing bob */
                 want = V3(pc->pos.x - camDir.x * g_set.camDist, camY + g_set.camDist * g_set.camHeight, pc->pos.z - camDir.z * g_set.camDist);
                 want.x = clampf(want.x, -ARENA_W + 1, ARENA_W - 1);
@@ -3596,7 +3957,9 @@ int sarpbc_main(int argc, char **argv)
                                : V3(pc->pos.x + camDir.x * 2.0f, camY + 0.9f, pc->pos.z + camDir.z * 2.0f);
                 cam.position = want;
                 cam.target   = look;
-                if (camShake > 0.01f) {
+                if (camShake > prevShake + 0.15f) rumble(camShake * 0.8f, camShake * 0.6f, 0.25f + camShake * 0.35f);
+                prevShake = camShake;
+                if (camShake > 0.01f && g_set.camShake) {
                     cam.position = Vector3Add(cam.position, p_randv3(-camShake * 0.45f, camShake * 0.45f));
                     cam.target   = Vector3Add(cam.target,   p_randv3(-camShake * 0.25f, camShake * 0.25f));
                 }
@@ -3631,11 +3994,13 @@ int sarpbc_main(int argc, char **argv)
             for (i = 0; i < nCars; i++) rcars[i] = cars[i];
             rball = ball;
             if (shotMode == 2 && ++frameNo % 60 == 0) {   /* --menushot: one capture per front-end screen */
-                static const int shotScr[] = { SCR_MENU, SCR_PLAY, SCR_ONLINE, SCR_OFFLINE, SCR_GARAGE };
-                static const char *shotName[] = { "menu.png", "menu_play.png", "menu_online.png", "menu_offline.png", "menu_garage.png" };
+                static const int shotScr[] = { SCR_MENU, SCR_PLAY, SCR_ONLINE, SCR_OFFLINE, SCR_GARAGE,
+                                               SCR_SETTINGS, SCR_SETTINGS, SCR_SETTINGS, SCR_SETTINGS };
+                static const char *shotName[] = { "menu.png", "menu_play.png", "menu_online.png", "menu_offline.png", "menu_garage.png",
+                                                  "menu_set_controls.png", "menu_set_camera.png", "menu_set_video.png", "menu_set_gameplay.png" };
                 int k = frameNo / 60 - 1;
                 TakeScreenshot(shotName[k]);
-                if (k + 1 < 5) screen = shotScr[k + 1]; else quit = 1;
+                if (k + 1 < 9) { screen = shotScr[k + 1]; setTab = k + 1 >= 5 ? k + 1 - 5 : 0; } else quit = 1;
             }
             if (shotMode == 3) {   /* --carshot: 4 views, 90 deg apart */
                 int view = frameNo / 20;
@@ -3841,7 +4206,7 @@ int sarpbc_main(int argc, char **argv)
                 }
                 net_client_draw_nameplates(&netClient, cpos, team, cdemo, cam);
                 net_client_draw_hud(&netClient, sw, sh);
-                if (IsKeyDown(KEY_TAB)) {
+                if (act_down(ACT_SCOREBOARD)) {
                     net_client_draw_scoreboard(&netClient, sw, sh);
                 }
             }
@@ -4073,25 +4438,244 @@ int sarpbc_main(int argc, char **argv)
                 if (ui_button((Rectangle){ bx, by + 4 * (bh + gap), bw, bh }, "EXIT GAME", NULL, 0)) uiAct = UA_QUIT;
                 ui_end();
             } else if (screen == SCR_SETTINGS) {
-                MenuItem it[13];
-                memset(it, 0, sizeof(it));
-                it[0].label = "CAMERA DISTANCE";  snprintf(it[0].value, 48, "%.1f m", g_set.camDist);
-                it[1].label = "CAMERA HEIGHT";    snprintf(it[1].value, 48, "%.2f", g_set.camHeight);
-                it[2].label = "FIELD OF VIEW";    snprintf(it[2].value, 48, "%.0f", g_set.fov);
-                it[3].label = "BOOST FOV KICK";   snprintf(it[3].value, 48, "%s", g_set.boostFov ? "On" : "Off");
-                it[4].label = "MATCH LENGTH";     snprintf(it[4].value, 48, "%s", MATCH_NAMES[g_set.matchIdx]);
-                it[5].label = "INVERT AIR PITCH"; snprintf(it[5].value, 48, "%s", g_set.invertPitch ? "On" : "Off");
-                it[6].label = "FULLSCREEN";       snprintf(it[6].value, 48, "%s", g_set.fullscreen ? "On" : "Off");
-                it[7].label = "SHOW FPS";         snprintf(it[7].value, 48, "%s", g_set.showFps ? "On" : "Off");
-                it[8].label = "SHOW CONTROLS";    snprintf(it[8].value, 48, "%s", g_set.showHints ? "On" : "Off");
-                it[9].label = "SHADOWS";          snprintf(it[9].value, 48, "%s", g_set.shadows ? "On" : "Off");
-                it[10].label = "BLOOM";           snprintf(it[10].value, 48, "%s", g_set.bloom ? "On" : "Off");
-                it[11].label = "USE ORIGINAL CAMERA"; snprintf(it[11].value, 48, "5.4 m / 59");
-                it[12].label = "BACK";
-                menu_run("SETTINGS", it, 13, &setSel, nav, &act, &adj);
-                if (setSel == 4)
-                    DrawText("match length applies to offline matches", sw / 2 - MeasureText("match length applies to offline matches", 18) / 2,
-                             sh - 70, 18, (Color){ 255, 190, 120, 255 });
+                /* --- settings: RL-style tabbed pages, rebindable controls ------------- */
+                static const char *TABS[4] = { "CONTROLS", "CAMERA", "VIDEO", "GAMEPLAY" };
+                static const char *ONOFF[2] = { "Off", "On" };
+                const char *desc = NULL;
+                int fromPause = settingsFrom == SCR_PAUSE, t, a, s, d, newTab = -1, startBind = -1;
+                int wasBinding = bindAct >= 0;   /* prompt open at frame start: the page ignores mouse/keys */
+                Rectangle dead = { -10, -10, 1, 1 };
+                float tabX = 64 + 52, tabY = 118, tabW = 180, tabH = 46, y0 = 190;
+#define SET_DESC(txt) do { if (g_ui.focus == g_ui.count - 1) desc = (txt); } while (0)
+                /* rebinding prompt: capture the next key / button */
+                if (bindAct >= 0) {
+                    int code = -1, k;
+                    bindTimer -= dt;
+                    if (IsKeyPressed(KEY_ESCAPE) || bindTimer <= 0.0f) bindAct = -1;
+                    else if (bindSlot < 2) {
+                        while ((k = GetKeyPressed()) > 0) {
+                            if (k == KEY_ESCAPE) continue;
+                            code = (k == KEY_BACKSPACE || k == KEY_DELETE) ? 0 : k;
+                        }
+                        for (k = MOUSE_BUTTON_LEFT; k <= MOUSE_BUTTON_BACK && code < 0; k++)
+                            if (IsMouseButtonPressed(k)) code = BIND_MOUSE + k;
+                    } else {
+                        if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressed(KEY_DELETE)) code = 0;
+                        for (k = 1; k <= GAMEPAD_BUTTON_RIGHT_THUMB && code < 0; k++)
+                            if (k != GAMEPAD_BUTTON_LEFT_TRIGGER_2 && k != GAMEPAD_BUTTON_RIGHT_TRIGGER_2 &&
+                                IsGamepadAvailable(0) && IsGamepadButtonPressed(0, k)) code = k;
+                        if (code < 0 && g_trigNow[0] > 0.5f && g_trigPrev[0] <= 0.5f) code = GAMEPAD_BUTTON_LEFT_TRIGGER_2;
+                        if (code < 0 && g_trigNow[1] > 0.5f && g_trigPrev[1] <= 0.5f) code = GAMEPAD_BUTTON_RIGHT_TRIGGER_2;
+                    }
+                    if (code >= 0) { bind_assign(bindAct, bindSlot, code); settings_save(); bindAct = -1; }
+                    while (GetCharPressed() > 0) {}
+                } else {
+                    /* LB / RB (or Q / E) flip tabs */
+                    int td = (IsKeyPressed(KEY_Q) || (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_TRIGGER_1))) ? -1
+                           : (IsKeyPressed(KEY_E) || (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))) ? 1 : 0;
+                    if (td) { setTab = (setTab + td + 4) % 4; setScroll = 0.0f; }
+                    if (nav.back) uiAct = UA_SETTINGS_BACK;
+                }
+
+                if (fromPause) DrawRectangle(0, 0, sw, sh, (Color){ 0, 0, 0, 160 });
+                ui_begin(300 + setTab, nav, 5);
+                g_uiClip = wasBinding ? dead : (Rectangle){ 0 };
+                ui_chrome("SETTINGS", fromPause ? "Match paused" : NULL,
+                          g_usingPad ? "LB / RB  Change tab      A  Select / Rebind      B  Back"
+                                     : "Q / E  Change tab      ENTER / CLICK  Select / Rebind      ESC  Back");
+                /* tab bar with shoulder-button hints either side */
+                if (g_usingPad) {
+                    draw_pad_glyph(GAMEPAD_BUTTON_LEFT_TRIGGER_1, tabX - 30, tabY + tabH * 0.5f, 13, g_set.padStyle);
+                    draw_pad_glyph(GAMEPAD_BUTTON_RIGHT_TRIGGER_1, tabX + 4 * (tabW + 8) + 22, tabY + tabH * 0.5f, 13, g_set.padStyle);
+                } else {
+                    draw_keycap("Q", tabX - 30, tabY + tabH * 0.5f, 28, 0);
+                    draw_keycap("E", tabX + 4 * (tabW + 8) + 22, tabY + tabH * 0.5f, 28, 0);
+                }
+                for (t = 0; t < 4; t++)
+                    if (ui_tab((Rectangle){ tabX + t * (tabW + 8), tabY, tabW, tabH }, TABS[t], t == setTab)) newTab = t;
+                if (ui_button((Rectangle){ (float)sw - 64 - 170, tabY, 170, tabH }, "BACK", NULL, 0)) uiAct = UA_SETTINGS_BACK;
+
+                if (setTab == 0) {
+                    /* ---- CONTROLS: bindings table (left) + controller tuning (right) ---- */
+                    float rightW = 450, tableX = 64;
+                    float tableW = clampf((float)sw - 128 - 40 - rightW, 640, 920);
+                    float colW = clampf((tableW - 330) / 3.0f, 150, 190), colGap = 8;
+                    float col0 = tableX + tableW - 3 * colW - 2 * colGap;
+                    float rowH = 40, vy0 = y0 + 34, vy1 = (float)sh - 100, viewH = vy1 - vy0;
+                    float contentH = ACT_COUNT * rowH, maxScroll = fmaxf(0.0f, contentH - viewH);
+                    float rx = tableX + tableW + 40, ry = y0, sy, spH = 44, spGap = 6;
+                    int focusRow = -1;
+                    Vector2 mp = GetMousePosition();
+                    static const char *COLS[3] = { "KEYBOARD", "ALTERNATE", "CONTROLLER" };
+
+                    ui_panel((Rectangle){ tableX - 8, y0 - 8, tableW + 16, vy1 - y0 + 16 }, 0.03f, (Color){ 10, 14, 22, 215 }, UI_PANEL_LINE);
+                    DrawText("ACTION", (int)tableX + 14, (int)y0 + 6, 15, UI_TEXT_DIM);
+                    for (s = 0; s < 3; s++)
+                        DrawText(COLS[s], (int)(col0 + s * (colW + colGap) + colW * 0.5f - MeasureText(COLS[s], 15) * 0.5f), (int)y0 + 6, 15,
+                                 s == 2 ? (IsGamepadAvailable(0) ? UI_ACCENT : UI_TEXT_DIM) : UI_TEXT_DIM);
+                    if (CheckCollisionPointRec(mp, (Rectangle){ tableX, vy0, tableW, viewH })) setScroll -= GetMouseWheelMove() * 48.0f;
+                    setScroll = clampf(setScroll, 0.0f, maxScroll);
+                    BeginScissorMode((int)(tableX - 4), (int)vy0, (int)(tableW + 8), (int)viewH);
+                    g_uiClip = wasBinding ? dead : (Rectangle){ tableX - 4, vy0, tableW + 8, viewH };
+                    for (a = 0; a < ACT_COUNT; a++) {
+                        float yy = vy0 + a * rowH - setScroll;
+                        if (a & 1) DrawRectangleRounded((Rectangle){ tableX, yy, tableW, rowH }, 0.2f, 4, (Color){ 255, 255, 255, 8 });
+                        ui_text(ACT_LABELS[a], (int)tableX + 14, (int)(yy + rowH * 0.5f - 9), 18, UI_TEXT);
+                        for (s = 0; s < 3; s++) {
+                            Rectangle cr = { col0 + s * (colW + colGap), yy + 3, colW, rowH - 6 };
+                            int code = s < 2 ? g_set.kb[a][s] : g_set.pad[a];
+                            const char *empty = (s == 2 && (a == ACT_LEFT || a == ACT_RIGHT)) ? "L-STICK" : "-";
+                            if (ui_bindcell(cr, s == 2, code, bindAct == a && bindSlot == s, empty)) startBind = a * 3 + s;
+                            if (g_ui.focus == g_ui.count - 1) {
+                                focusRow = a;
+                                desc = s == 2 ? "Select, then press a controller button. BACKSPACE clears, ESC cancels."
+                                              : "Select, then press a key or mouse button. BACKSPACE clears, ESC cancels.";
+                            }
+                        }
+                    }
+                    EndScissorMode();
+                    g_uiClip = wasBinding ? dead : (Rectangle){ 0 };
+                    if (focusRow >= 0 && !g_ui.mouseMoved) {   /* keep the focused row in view */
+                        float top = focusRow * rowH, bot = top + rowH;
+                        if (top < setScroll) setScroll = top;
+                        if (bot > setScroll + viewH) setScroll = bot - viewH;
+                    }
+                    if (maxScroll > 0.0f) {
+                        float bh = viewH * viewH / contentH, by = vy0 + (viewH - bh) * (setScroll / maxScroll);
+                        DrawRectangleRounded((Rectangle){ tableX + tableW + 2, by, 4, bh }, 1.0f, 4, UI_ACCENT);
+                    }
+
+                    /* controller tuning */
+                    ui_panel((Rectangle){ rx - 8, ry - 8, rightW + 16, vy1 - ry + 16 }, 0.03f, (Color){ 10, 14, 22, 215 }, UI_PANEL_LINE);
+                    ui_text("CONTROLLER", (int)rx + 6, (int)ry + 4, 20, UI_ACCENT_HI);
+                    sy = ry + 36;
+                    if ((d = ui_spinner((Rectangle){ rx, sy, rightW, spH }, "DEADZONE", TextFormat("%.2f", g_set.deadzone))))
+                        g_set.deadzone = clampf(roundf((g_set.deadzone + 0.02f * d) * 100) / 100, 0.0f, 0.6f);
+                    SET_DESC("How far the stick must move before the car responds. Raise it if your car drifts on its own.");
+                    sy += spH + spGap;
+                    if ((d = ui_spinner((Rectangle){ rx, sy, rightW, spH }, "DODGE DEADZONE", TextFormat("%.2f", g_set.dodgeDeadzone))))
+                        g_set.dodgeDeadzone = clampf(roundf((g_set.dodgeDeadzone + 0.05f * d) * 100) / 100, 0.1f, 0.95f);
+                    SET_DESC("Stick tilt needed for a second jump to dodge instead of double jumping.");
+                    sy += spH + spGap;
+                    if ((d = ui_spinner((Rectangle){ rx, sy, rightW, spH }, "STEERING SENSITIVITY", TextFormat("%.1f", g_set.steerSens))))
+                        g_set.steerSens = clampf(roundf((g_set.steerSens + 0.1f * d) * 10) / 10, 0.5f, 3.0f);
+                    SET_DESC("Multiplies stick input for steering on the ground.");
+                    sy += spH + spGap;
+                    if ((d = ui_spinner((Rectangle){ rx, sy, rightW, spH }, "AERIAL SENSITIVITY", TextFormat("%.1f", g_set.aerialSens))))
+                        g_set.aerialSens = clampf(roundf((g_set.aerialSens + 0.1f * d) * 10) / 10, 0.5f, 3.0f);
+                    SET_DESC("Multiplies stick input for pitch, yaw and air roll in the air.");
+                    sy += spH + spGap;
+                    if (ui_spinner((Rectangle){ rx, sy, rightW, spH }, "INVERT AIR PITCH", ONOFF[g_set.invertPitch])) g_set.invertPitch = !g_set.invertPitch;
+                    SET_DESC("Flip forward / back for pitching the car in the air.");
+                    sy += spH + spGap;
+                    if (ui_spinner((Rectangle){ rx, sy, rightW, spH }, "VIBRATION", ONOFF[g_set.vibration])) g_set.vibration = !g_set.vibration;
+                    SET_DESC("Rumble on ball hits, goals and demolitions (XInput controllers).");
+                    sy += spH + spGap;
+                    if (ui_spinner((Rectangle){ rx, sy, rightW, spH }, "BUTTON PROMPTS", g_set.padStyle ? "PlayStation" : "Xbox")) g_set.padStyle = !g_set.padStyle;
+                    SET_DESC("Which controller button icons to show.");
+                    sy += spH + spGap;
+                    if (ui_button((Rectangle){ rx, sy, rightW, spH }, "RESET CONTROLS TO DEFAULT", NULL, 0)) {
+                        controls_default_bindings(); controls_default_tuning(); settings_save();
+                    }
+                    SET_DESC("Restore every binding and controller option above.");
+                    sy += spH + 14;
+                    /* live stick view: deadzone (red), dodge deadzone (ring), raw stick (dot) */
+                    if (sy + 112 < vy1) {
+                        Vector2 c = { rx + 60, sy + 54 };
+                        float R = 50, gx = 0, gy = 0;
+                        int have = IsGamepadAvailable(0);
+                        if (have) { gx = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X); gy = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_Y); }
+                        DrawCircleV(c, R, (Color){ 18, 24, 36, 255 });
+                        DrawCircleV(c, R * g_set.deadzone, (Color){ 200, 60, 50, 150 });
+                        DrawRing(c, R * g_set.dodgeDeadzone - 1, R * g_set.dodgeDeadzone + 1, 0, 360, 48, UI_ACCENT);
+                        DrawCircleLinesV(c, R, (Color){ 70, 90, 120, 255 });
+                        if (have) DrawCircleV((Vector2){ c.x + gx * R, c.y + gy * R }, 6, sqrtf(gx * gx + gy * gy) >= g_set.dodgeDeadzone ? UI_ACCENT_HI : RAYWHITE);
+                        ui_text("LEFT STICK", (int)c.x + 72, (int)c.y - 34, 18, UI_TEXT);
+                        DrawText(have ? TextFormat("%.28s", GetGamepadName(0)) : "No controller detected", (int)c.x + 72, (int)c.y - 10, 15, have ? UI_TEXT_DIM : (Color){ 230, 120, 90, 255 });
+                        DrawText("red = deadzone, ring = dodge deadzone", (int)c.x + 72, (int)c.y + 12, 14, UI_TEXT_DIM);
+                    }
+                } else if (setTab == 1) {
+                    /* ---- CAMERA ---- */
+                    float x = 64, w = 640, h = 48, gap = 8, y = y0;
+                    if (ui_spinner((Rectangle){ x, y, w, h }, "CAMERA SHAKE", ONOFF[g_set.camShake])) g_set.camShake = !g_set.camShake;
+                    SET_DESC("Shake the camera on goals and demolitions.");
+                    y += h + gap;
+                    if ((d = ui_spinner((Rectangle){ x, y, w, h }, "FIELD OF VIEW", TextFormat("%.0f", g_set.fov)))) g_set.fov = clampf(g_set.fov + d, 45.0f, 90.0f);
+                    SET_DESC("Vertical field of view in degrees. Higher shows more of the field.");
+                    y += h + gap;
+                    if ((d = ui_spinner((Rectangle){ x, y, w, h }, "DISTANCE", TextFormat("%.1f m", g_set.camDist)))) g_set.camDist = clampf(g_set.camDist + 0.5f * d, 3.0f, 14.0f);
+                    SET_DESC("How far behind the car the camera sits. [ and ] adjust it in game.");
+                    y += h + gap;
+                    if ((d = ui_spinner((Rectangle){ x, y, w, h }, "HEIGHT", TextFormat("%.2f", g_set.camHeight)))) g_set.camHeight = clampf(roundf((g_set.camHeight + 0.02f * d) * 100) / 100, 0.10f, 0.80f);
+                    SET_DESC("Camera height relative to its distance.");
+                    y += h + gap;
+                    if ((d = ui_spinner((Rectangle){ x, y, w, h }, "STIFFNESS", TextFormat("%.2f", g_set.camStiffness)))) g_set.camStiffness = clampf(roundf((g_set.camStiffness + 0.05f * d) * 100) / 100, 0.0f, 1.0f);
+                    SET_DESC("How tightly the camera follows the car's heading. 1.0 is locked on.");
+                    y += h + gap;
+                    if ((d = ui_spinner((Rectangle){ x, y, w, h }, "SWIVEL SPEED", TextFormat("%.1f", g_set.camSwivel)))) g_set.camSwivel = clampf(g_set.camSwivel + 0.5f * d, 1.0f, 10.0f);
+                    SET_DESC("How fast the right stick swivels the camera around the car. Pull down to look behind.");
+                    y += h + gap;
+                    if (ui_spinner((Rectangle){ x, y, w, h }, "BALL CAMERA", g_set.ballCamHold ? "Hold" : "Toggle")) g_set.ballCamHold = !g_set.ballCamHold;
+                    SET_DESC("Toggle: press to switch ball cam on or off. Hold: ball cam only while held.");
+                    y += h + gap;
+                    if (ui_spinner((Rectangle){ x, y, w, h }, "BOOST FOV KICK", ONOFF[g_set.boostFov])) g_set.boostFov = !g_set.boostFov;
+                    SET_DESC("Widen the view slightly while boosting.");
+                    y += h + gap + 6;
+                    if (ui_button((Rectangle){ x, y, (w - 10) * 0.5f, h }, "DEFAULT CAMERA", NULL, 0)) {
+                        g_set.camDist = 4.6f; g_set.camHeight = 0.44f; g_set.fov = 75.0f; g_set.boostFov = 1; camera_defaults();
+                    }
+                    SET_DESC("Restore the default camera settings.");
+                    if (ui_button((Rectangle){ x + (w + 10) * 0.5f, y, (w - 10) * 0.5f, h }, "CLASSIC CAMERA", NULL, 0)) {
+                        g_set.camDist = 5.4f; g_set.camHeight = 0.11f; g_set.fov = 59.0f;
+                    }
+                    SET_DESC("The original low, far camera: 5.4 m, 59 degrees.");
+                } else if (setTab == 2) {
+                    /* ---- VIDEO ---- */
+                    float x = 64, w = 640, h = 48, gap = 8, y = y0;
+                    if (ui_spinner((Rectangle){ x, y, w, h }, "FULLSCREEN", ONOFF[g_set.fullscreen])) { g_set.fullscreen = !g_set.fullscreen; ToggleBorderlessWindowed(); }
+                    SET_DESC("Borderless fullscreen window.");
+                    y += h + gap;
+                    if (ui_spinner((Rectangle){ x, y, w, h }, "SHADOWS", ONOFF[g_set.shadows])) g_set.shadows = !g_set.shadows;
+                    SET_DESC("Sun shadows for cars, ball and arena.");
+                    y += h + gap;
+                    if (ui_spinner((Rectangle){ x, y, w, h }, "BLOOM", ONOFF[g_set.bloom])) g_set.bloom = !g_set.bloom;
+                    SET_DESC("Glow around bright lights, boost and goal explosions.");
+                    y += h + gap;
+                    if (ui_spinner((Rectangle){ x, y, w, h }, "SHOW FPS", ONOFF[g_set.showFps])) g_set.showFps = !g_set.showFps;
+                    SET_DESC("Frame-rate counter in the top-left corner.");
+                } else {
+                    /* ---- GAMEPLAY ---- */
+                    float x = 64, w = 640, h = 48, gap = 8, y = y0;
+                    if ((d = ui_spinner((Rectangle){ x, y, w, h }, "MATCH LENGTH", MATCH_NAMES[g_set.matchIdx]))) g_set.matchIdx = (g_set.matchIdx + d + 4) % 4;
+                    SET_DESC("Length of offline exhibition matches. Online matches are set by the server.");
+                    y += h + gap;
+                    if ((d = ui_spinner((Rectangle){ x, y, w, h }, "BOT DIFFICULTY", SKILL_NAMES[g_set.botSkill]))) g_set.botSkill = (g_set.botSkill + d + 3) % 3;
+                    SET_DESC("Skill of the bots in offline matches.");
+                    y += h + gap;
+                    if (ui_spinner((Rectangle){ x, y, w, h }, "SHOW CONTROL HINTS", ONOFF[g_set.showHints])) g_set.showHints = !g_set.showHints;
+                    SET_DESC("Show your bindings along the bottom of the screen in game.");
+                }
+                if (desc) DrawText(desc, 64, sh - 66, 17, UI_TEXT);
+                ui_end();
+                g_uiClip = (Rectangle){ 0 };
+#undef SET_DESC
+                if (wasBinding) { newTab = startBind = -1; uiAct = UA_NONE; }
+                if (newTab >= 0 && newTab != setTab) { setTab = newTab; setScroll = 0.0f; }
+                if (startBind >= 0) { bindAct = startBind / 3; bindSlot = startBind % 3; bindTimer = 6.0f; uiAct = UA_NONE; }
+
+                /* rebinding modal */
+                if (bindAct >= 0) {
+                    Rectangle pr = { sw * 0.5f - 300, sh * 0.5f - 110, 600, 220 };
+                    DrawRectangle(0, 0, sw, sh, (Color){ 0, 0, 0, 150 });
+                    ui_panel(pr, 0.08f, UI_PANEL, UI_ACCENT);
+                    ui_text_c(TextFormat("REBIND  %s", ACT_LABELS[bindAct]), pr.x + pr.width * 0.5f, (int)pr.y + 28, 24, UI_ACCENT_HI);
+                    ui_text_c(bindSlot == 2 ? "Press a button on your controller" : "Press a key or mouse button",
+                              pr.x + pr.width * 0.5f, (int)pr.y + 84, 26, UI_TEXT);
+                    if (bindSlot == 2 && !IsGamepadAvailable(0))
+                        ui_text_c("No controller detected", pr.x + pr.width * 0.5f, (int)pr.y + 122, 18, (Color){ 230, 120, 90, 255 });
+                    ui_text_c(TextFormat("ESC  cancel      BACKSPACE  clear      %d", (int)ceilf(bindTimer)),
+                              pr.x + pr.width * 0.5f, (int)(pr.y + pr.height - 44), 17, UI_TEXT_DIM);
+                }
             } else if (screen == SCR_GAME && state == ST_OVER) {
                 /* --- post-match: result, rosters, next step --------------------------- */
                 int me = isOnline ? netClient.localSlot : 0, myTeam = team[me];
@@ -4150,7 +4734,8 @@ int sarpbc_main(int argc, char **argv)
         case UA_GO_ONLINE:   screen = SCR_ONLINE; onlineMsg[0] = 0; break;
         case UA_GO_OFFLINE:  screen = SCR_OFFLINE; break;
         case UA_GO_GARAGE:   screen = SCR_GARAGE; break;
-        case UA_GO_SETTINGS: settingsFrom = SCR_MENU; setSel = 0; screen = SCR_SETTINGS; break;
+        case UA_GO_SETTINGS: settingsFrom = SCR_MENU; setScroll = 0.0f; screen = SCR_SETTINGS; break;
+        case UA_SETTINGS_BACK: settings_save(); screen = settingsFrom; break;
         case UA_QUIT:        quit = 1; break;
         case UA_FIND_MATCH:  START_SEARCH(); break;
         case UA_CANCEL_SEARCH:
@@ -4165,7 +4750,7 @@ int sarpbc_main(int argc, char **argv)
             screen = SCR_GAME;
             break;
         case UA_RESUME:          screen = SCR_GAME; break;
-        case UA_PAUSE_SETTINGS:  settingsFrom = SCR_PAUSE; setSel = 0; screen = SCR_SETTINGS; break;
+        case UA_PAUSE_SETTINGS:  settingsFrom = SCR_PAUSE; setScroll = 0.0f; screen = SCR_SETTINGS; break;
         case UA_RESTART:         NEW_MATCH(); screen = SCR_GAME; break;
         case UA_LEAVE_MATCH:
             net_client_disconnect(&netClient);
@@ -4192,26 +4777,7 @@ int sarpbc_main(int argc, char **argv)
             settings_save();
             carAdj = 0;
         }
-        if (screen == SCR_SETTINGS) {
-            if (adj) {
-                switch (setSel) {
-                case 0: g_set.camDist   = clampf(g_set.camDist + 0.5f * adj, 3.0f, 14.0f); break;
-                case 1: g_set.camHeight = clampf(g_set.camHeight + 0.02f * adj, 0.10f, 0.80f); break;
-                case 2: g_set.fov       = clampf(g_set.fov + 1.0f * adj, 45.0f, 90.0f); break;
-                case 3: g_set.boostFov    = !g_set.boostFov; break;
-                case 4: g_set.matchIdx    = (g_set.matchIdx + adj + 4) % 4; break;
-                case 5: g_set.invertPitch = !g_set.invertPitch; break;
-                case 6: g_set.fullscreen  = !g_set.fullscreen; ToggleBorderlessWindowed(); break;
-                case 7: g_set.showFps     = !g_set.showFps; break;
-                case 8: g_set.showHints   = !g_set.showHints; break;
-                case 9: g_set.shadows     = !g_set.shadows; break;
-                case 10: g_set.bloom      = !g_set.bloom; break;
-                default: break;
-                }
-            }
-            if (act == 11) { g_set.camDist = 5.4f; g_set.camHeight = 0.11f; g_set.fov = 59.0f; }
-            if (act == 12 || nav.back) { settings_save(); screen = settingsFrom; }
-        }
+
     }
 #undef KICKOFF
 #undef NEW_MATCH
