@@ -35,6 +35,7 @@
   #include <sys/socket.h>
   #include <netinet/in.h>
   #include <arpa/inet.h>
+  #include <netdb.h>
   #include <unistd.h>
   #include <fcntl.h>
   #include <errno.h>
@@ -80,6 +81,23 @@ static inline NetAddr net_addr_create(const char *ip_str, int port)
         addr.in.sin_addr.s_addr = inet_addr(ip_str);
     }
     return addr;
+}
+
+/* Resolve "1.2.3.4", "localhost" or a DNS name. Returns 1 on success. */
+static inline int net_addr_resolve(const char *host, int port, NetAddr *out)
+{
+    struct addrinfo hints, *res = NULL;
+    if (!host || !host[0] || !out) return 0;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return 0;
+    memset(out, 0, sizeof(*out));
+    memcpy(&out->in, res->ai_addr, sizeof(out->in));
+    out->in.sin_family = AF_INET;
+    out->in.sin_port = htons((unsigned short)port);
+    freeaddrinfo(res);
+    return 1;
 }
 
 static inline void net_addr_to_string(const NetAddr *addr, char *out, int maxlen)

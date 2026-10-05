@@ -33,6 +33,7 @@
 
 #include "net_client.h"
 #include "physics_sim.h"
+#include "net_sync.h"
 
 static const Vector3 LIGHT_DIR = { -0.35f, -0.85f, 0.4f };
 
@@ -3073,18 +3074,19 @@ static void net_client_draw_hud(const NetClient *cli, int sw, int sh)
     (void)sh;
     if (!cli || cli->state != NET_CONNECTED) return;
 
-    int bw = 145, bh = 28;
+    int bw = cli->lossPct >= 0.5f ? 215 : 145, bh = 28;
     int bx = sw - bw - 18, by = 14;
 
     DrawRectangleRounded((Rectangle){ (float)bx + 2, (float)by + 2, (float)bw, (float)bh }, 0.35f, 4, (Color){ 0, 0, 0, 100 });
     DrawRectangleRounded((Rectangle){ (float)bx, (float)by, (float)bw, (float)bh }, 0.35f, 4, (Color){ 12, 16, 26, 215 });
     DrawRectangleRoundedLinesEx((Rectangle){ (float)bx, (float)by, (float)bw, (float)bh }, 0.35f, 4, 1.2f, (Color){ 45, 65, 95, 180 });
 
-    Color pingCol = cli->pingMs < 60.0f ? (Color){ 50, 220, 120, 255 } :
-                    cli->pingMs < 120.0f ? (Color){ 240, 200, 50, 255 } : (Color){ 240, 70, 70, 255 };
+    Color pingCol = (cli->pingMs < 60.0f && cli->lossPct < 2.0f) ? (Color){ 50, 220, 120, 255 } :
+                    (cli->pingMs < 120.0f && cli->lossPct < 8.0f) ? (Color){ 240, 200, 50, 255 } : (Color){ 240, 70, 70, 255 };
 
     DrawCircle(bx + 14, by + bh / 2, 4.0f, pingCol);
-    const char *pingStr = TextFormat("ONLINE %.0fms", cli->pingMs);
+    const char *pingStr = cli->lossPct >= 0.5f ? TextFormat("ONLINE %.0fms  %.1f%% loss", cli->pingMs, cli->lossPct)
+                                               : TextFormat("ONLINE %.0fms", cli->pingMs);
     DrawText(pingStr, bx + 26, by + 7, 13, RAYWHITE);
 
     if (cli->demoBannerTimer > 0.0f) {
@@ -3097,6 +3099,191 @@ static void net_client_draw_hud(const NetClient *cli, int sw, int sh)
         DrawRectangleRounded((Rectangle){ (float)mx, (float)my, (float)mwW, (float)mwH }, 0.35f, 4, ColorAlpha((Color){ 220, 60, 20, 230 }, alpha));
         DrawRectangleRoundedLinesEx((Rectangle){ (float)mx, (float)my, (float)mwW, (float)mwH }, 0.35f, 4, 1.5f, ColorAlpha(YELLOW, alpha));
         DrawText(demoMsg, mx + mwW / 2 - mw / 2, my + 8, 20, ColorAlpha(RAYWHITE, alpha));
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Online prediction / rollback                                               */
+/*                                                                            */
+/* Every client tick we simulate the whole world (our car with our real       */
+/* input, remote cars with their last known input, the ball) and record our   */
+/* input + resulting car state. Each server snapshot says which of our input  */
+/* ticks it has simulated (ack). We restart from the authoritative state at   */
+/* that tick and re-simulate up to the present with the recorded inputs, so   */
+/* the world is always "server truth, fast-forwarded to now". Whatever small  */
+/* jump that causes is moved into a visual offset that decays over ~0.1 s,    */
+/* so corrections are invisible instead of rubber-banding or freezing.        */
+/* ------------------------------------------------------------------------ */
+#define PRED_HIST        256     /* ~2.1 s of history                          */
+#define MAX_REPLAY       96      /* replay at most 0.8 s (covers ~700 ms RTT)  */
+#define SNAP_CAR_DIST    6.0f    /* bigger errors teleport (kickoff, respawn)  */
+#define SNAP_BALL_DIST   10.0f
+#define VIS_DECAY_CAR    14.0f   /* 1/s: visual error smoothing rates          */
+#define VIS_DECAY_REMOTE 10.0f
+#define VIS_DECAY_BALL   12.0f
+
+typedef struct PredFrame { uint32_t tick; Input in; Car car; } PredFrame;
+
+typedef struct OnlineSim {
+    PredFrame  hist[PRED_HIST];
+    Input      remoteIn[SARP_MAX_CLIENTS];
+    Vector3    visOfs[SARP_MAX_CLIENTS];
+    Quaternion visRot[SARP_MAX_CLIENTS];
+    Vector3    ballVisOfs;
+    Quaternion ballVisRot;
+    uint32_t   lastSnap;
+    int        haveSnap;
+    int        lastReplay;       /* ticks re-simulated on the last snapshot   */
+    float      lastCorrection;   /* metres our car moved on the last snapshot */
+} OnlineSim;
+static OnlineSim g_on;
+
+static void online_reset(void)
+{
+    int i;
+    memset(&g_on, 0, sizeof(g_on));
+    for (i = 0; i < SARP_MAX_CLIENTS; i++) g_on.visRot[i] = QuaternionIdentity();
+    g_on.ballVisRot = QuaternionIdentity();
+}
+
+static int online_car_live(const NetClient *nc, const Car *cars, int i)
+{
+    if (i != nc->localSlot && !nc->players[i].active) return 0;
+    return !cars[i].demolished;
+}
+
+/* One fixed tick of the client-side world, in the same order as the server. */
+static void online_step_world(Car *cars, Ball *ball, const NetClient *nc, const Input *myIn, float h, int fx)
+{
+    int i, me = nc->localSlot;
+    for (i = 0; i < SARP_MAX_CLIENTS; i++)
+        if (online_car_live(nc, cars, i)) car_step(&cars[i], i == me ? myIn : &g_on.remoteIn[i], h);
+    ball_step(ball, h);
+    for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+        Vector3 pv;
+        if (!online_car_live(nc, cars, i)) continue;
+        pv = ball->vel;
+        if (car_ball_collide(&cars[i], ball) && fx) {
+            float hitDelta = Vector3Distance(ball->vel, pv);
+            if (hitDelta > 3.0f)
+                particles_impact_burst(Vector3Lerp(cars[i].pos, ball->pos, 0.5f),
+                                       Vector3Normalize(Vector3Subtract(ball->pos, cars[i].pos)), hitDelta);
+        }
+    }
+    /* car-car bumps (demolitions are decided by the server and arrive in snapshots) */
+    for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+        int j;
+        if (!online_car_live(nc, cars, i)) continue;
+        for (j = i + 1; j < SARP_MAX_CLIENTS; j++) {
+            if (!online_car_live(nc, cars, j)) continue;
+            if (check_demolition(&cars[i], &cars[j], nc->players[i].team, nc->players[j].team)) continue;
+            car_car_collide(&cars[i], &cars[j]);
+        }
+    }
+}
+
+static void online_record(const NetClient *nc, const Input *in, const Car *myCar)
+{
+    PredFrame *pf = &g_on.hist[nc->clientTick % PRED_HIST];
+    pf->tick = nc->clientTick;
+    pf->in = *in;
+    pf->car = *myCar;
+}
+
+/* Move a correction from the simulation into the decaying visual offset. */
+static void online_absorb(Vector3 *pos, Quaternion *rot, Vector3 newPos, Quaternion newRot,
+                          Vector3 *visOfs, Quaternion *visRot, Vector3 *prevPos, Quaternion *prevRot)
+{
+    Vector3 d = Vector3Subtract(newPos, *pos);
+    Quaternion D = QuaternionNormalize(QuaternionMultiply(newRot, QuaternionInvert(*rot)));
+    *visOfs  = Vector3Subtract(*visOfs, d);
+    *prevPos = Vector3Add(*prevPos, d);
+    *visRot  = QuaternionNormalize(QuaternionMultiply(*visRot, QuaternionInvert(D)));
+    *prevRot = QuaternionNormalize(QuaternionMultiply(D, *prevRot));
+    *pos = newPos; *rot = newRot;
+}
+
+static void online_apply_snapshot(const NetClient *nc, Car *cars, Ball *ball,
+                                  Vector3 *prevPos, Quaternion *prevRot,
+                                  Vector3 *prevBallPos, Quaternion *prevBallRot, int *camSnap)
+{
+    static Car sim[SARP_MAX_CLIENTS];
+    const float h = 1.0f / PHYS_HZ;
+    int i, k, me = nc->localSlot, n = 0;
+    uint32_t A = nc->snapAckTick, C = nc->clientTick;
+    int canReplay = A > 0 && A <= C && (C - A) <= MAX_REPLAY && g_on.hist[A % PRED_HIST].tick == A;
+    Ball b;
+
+    /* 1. authoritative start state (our car keeps its predicted internals from tick A) */
+    for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+        sim[i] = cars[i];
+        if (!nc->players[i].active) continue;
+        if (i == me && canReplay) sim[i] = g_on.hist[A % PRED_HIST].car;
+        ns_car_from_net(&nc->snapCars[i], &sim[i]);
+        if (i != me) g_on.remoteIn[i] = ns_remote_input(&nc->snapCars[i]);
+    }
+    ns_ball_from_net(&nc->snapBall, &b);
+
+    /* 2. fast-forward to the present with our recorded inputs */
+    if (canReplay) {
+        n = (int)(C - A);
+        for (k = 1; k <= n; k++) {
+            PredFrame *pf = &g_on.hist[(A + k) % PRED_HIST];
+            online_step_world(sim, &b, nc, &pf->in, h, 0);
+            pf->car = sim[me];
+        }
+    }
+    g_on.lastReplay = n;
+
+    /* 3. adopt it, hiding the correction behind a decaying visual offset */
+    for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+        float dl;
+        if (!nc->players[i].active) {
+            if (i != me) { cars[i].pos = V3(0, -500, 0); cars[i].vel = V3(0, 0, 0); }
+            continue;
+        }
+        dl = Vector3Distance(sim[i].pos, cars[i].pos);
+        if (i == me) g_on.lastCorrection = dl;
+        if (!g_on.haveSnap || cars[i].pos.y < -100.0f || dl > SNAP_CAR_DIST || sim[i].demolished != cars[i].demolished) {
+            g_on.visOfs[i] = V3(0, 0, 0);
+            g_on.visRot[i] = QuaternionIdentity();
+            prevPos[i] = sim[i].pos;
+            prevRot[i] = sim[i].rot;
+            if (i == me) *camSnap = 1;
+            cars[i] = sim[i];
+        } else {
+            Vector3 p = cars[i].pos; Quaternion q = cars[i].rot;
+            online_absorb(&p, &q, sim[i].pos, sim[i].rot, &g_on.visOfs[i], &g_on.visRot[i], &prevPos[i], &prevRot[i]);
+            cars[i] = sim[i];
+        }
+    }
+
+    if (!g_on.haveSnap || Vector3Distance(b.pos, ball->pos) > SNAP_BALL_DIST) {
+        g_on.ballVisOfs = V3(0, 0, 0);
+        g_on.ballVisRot = QuaternionIdentity();
+        *prevBallPos = b.pos;
+        *prevBallRot = b.rot;
+        *ball = b;
+    } else {
+        Vector3 p = ball->pos; Quaternion q = ball->rot;
+        online_absorb(&p, &q, b.pos, b.rot, &g_on.ballVisOfs, &g_on.ballVisRot, prevBallPos, prevBallRot);
+        *ball = b;
+    }
+    g_on.haveSnap = 1;
+}
+
+static void online_decay_visuals(float dt, int me)
+{
+    int i;
+    for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+        float k = 1.0f - expf(-(i == me ? VIS_DECAY_CAR : VIS_DECAY_REMOTE) * dt);
+        g_on.visOfs[i] = Vector3Scale(g_on.visOfs[i], 1.0f - k);
+        g_on.visRot[i] = QuaternionSlerp(g_on.visRot[i], QuaternionIdentity(), k);
+    }
+    {
+        float k = 1.0f - expf(-VIS_DECAY_BALL * dt);
+        g_on.ballVisOfs = Vector3Scale(g_on.ballVisOfs, 1.0f - k);
+        g_on.ballVisRot = QuaternionSlerp(g_on.ballVisRot, QuaternionIdentity(), k);
     }
 }
 
@@ -3138,7 +3325,7 @@ int sarpbc_main(int argc, char **argv)
     float camY = 0.0f;
     int camSnap = 1;
     NetClient netClient;
-    int isOnline = 0, onlineSel = 4, prefTeamSel = 2, autoConnect = 0, onlineFirstSnap = 0;
+    int isOnline = 0, onlineSel = 4, prefTeamSel = 2, autoConnect = 0;
     char customIpInput[32] = "127.0.0.1";
     char playerNameInput[24] = "Striker";
 
@@ -3287,8 +3474,48 @@ int sarpbc_main(int argc, char **argv)
                 screen = SCR_MENU;
             }
         }
+        if (isOnline) {
+            int me = netClient.localSlot;
+            /* (re)load models for remote players before their state is applied */
+            for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+                if (!netClient.players[i].active) continue;
+                team[i] = netClient.players[i].team;
+                if (i != me && carModel[i] != netClient.players[i].car_model % CAR_COUNT) {
+                    carModel[i] = netClient.players[i].car_model % CAR_COUNT;
+                    load_car(CAR_NAMES[carModel[i]], &cars[i], &crs[i], lit, 1);
+                    cars[i].pos = V3(0, -500, 0);   /* force a clean snap on the next snapshot */
+                    g_on.lastSnap = netClient.snapCount - 1;
+                }
+            }
+            if (netClient.snapCount != g_on.lastSnap) {
+                g_on.lastSnap = netClient.snapCount;
+                online_apply_snapshot(&netClient, cars, &ball, prevPos, prevRot, &prevBallPos, &prevBallRot, &camSnap);
+            }
 
-        if (screen == SCR_GAME) {
+            /* match state comes from the server */
+            scoreBlue = netClient.scoreBlue;
+            scoreOrange = netClient.scoreOrange;
+            matchTime = netClient.serverMatchTime;
+            stateTimer = netClient.serverStateTimer;
+            state = netClient.serverGameState == 0 ? ST_COUNTDOWN :
+                    netClient.serverGameState == 2 ? ST_GOAL :
+                    netClient.serverGameState == 3 ? ST_OVER : ST_PLAY;
+
+            if (netClient.hasGoalEvent) {
+                netClient.hasGoalEvent = 0;
+                lastScorer = netClient.goalTeam == 0 ? 1 : 2;
+                particles_goal_explosion(ball.pos, lastScorer);
+                camShake = 1.0f;
+            }
+            if (netClient.hasDemoEvent) {
+                int v = netClient.demoVictimId, k = netClient.demoKillerId;
+                netClient.hasDemoEvent = 0;
+                if (v < SARP_MAX_CLIENTS) particles_demolition_explosion(cars[v].pos);
+                camShake = fmaxf(camShake, (v == me || k == me) ? 0.8f : 0.3f);
+            }
+        }
+
+        if (screen == SCR_GAME || (isOnline && (screen == SCR_PAUSE || screen == SCR_SETTINGS))) {
             Input frame = read_input();
             int frozen;
 
@@ -3296,8 +3523,8 @@ int sarpbc_main(int argc, char **argv)
             if (demoBannerTimer > 0.0f) demoBannerTimer -= dt;
             if (camShake > 0.0f) camShake = fmaxf(0.0f, camShake - 2.5f * dt);
 
-            if (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_P) ||
-                (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT))) {
+            if (screen == SCR_GAME && (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_P) ||
+                (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT)))) {
                 screen = SCR_PAUSE; pauseSel = 0;
             }
             if (shotMode) {
@@ -3309,9 +3536,10 @@ int sarpbc_main(int argc, char **argv)
                 if (frameNo == 172) TakeScreenshot("shot_kickoff.png");
                 if (++frameNo == 330) { TakeScreenshot("shot.png"); break; }
             }
+            /* (online: paused players keep simulating with neutral input) */
             frozen = state == ST_COUNTDOWN || state == ST_OVER || screen != SCR_GAME;
 
-            if (IsKeyPressed(KEY_C) || (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_UP)))
+            if (screen == SCR_GAME && (IsKeyPressed(KEY_C) || (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_UP))))
                 ballCam = !ballCam;
             if (IsKeyPressed(KEY_R) || (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_LEFT))) {
                 if (!isOnline) {
@@ -3325,7 +3553,7 @@ int sarpbc_main(int argc, char **argv)
             if (frozen) { memset(&in, 0, sizeof(in)); pendingJump = 0; }
 
             /* --- fixed-step simulation ----------------------------------- */
-            if (screen == SCR_GAME) acc += dt;
+            acc += dt;
             while (acc >= 1.0f / PHYS_HZ) {
                 float h = 1.0f / PHYS_HZ;
                 Input tick = in;
@@ -3336,17 +3564,9 @@ int sarpbc_main(int argc, char **argv)
                 tick.jumpPressed = pendingJump;
                 pendingJump = 0;
                 if (isOnline) {
-                    NetInput netIn;
-                    memset(&netIn, 0, sizeof(netIn));
-                    netIn.throttle = tick.throttle;
-                    netIn.steer = tick.steer;
-                    netIn.pitch = tick.pitch;
-                    netIn.yaw = tick.yaw;
-                    netIn.roll = tick.roll;
-                    netIn.jump = (uint8_t)tick.jump;
-                    netIn.jumpPressed = (uint8_t)tick.jumpPressed;
-                    netIn.boost = (uint8_t)tick.boost;
-                    netIn.slide = (uint8_t)tick.slide;
+                    /* simulate with exactly what the server will receive (bit-identical) */
+                    NetInput netIn = ns_input_to_net(&tick);
+                    tick = ns_input_from_net(&netIn);
                     net_client_send_tick(&netClient, &netIn);
                 }
 
@@ -3462,130 +3682,11 @@ int sarpbc_main(int argc, char **argv)
                         }
                     }
                 } else {
-                    /* ONLINE Authoritative Physics Simulation */
-                    /* 1. Client prediction on local car */
-                    if (!cars[mySlot].demolished) {
-                        car_step(&cars[mySlot], &tick, h);
-                    }
-
-                    /* 2. Ball simulation & prediction */
-                    ball_step(&ball, h);
-                    if (!cars[mySlot].demolished) {
-                        Vector3 prevBVel = ball.vel;
-                        if (car_ball_collide(&cars[mySlot], &ball)) {
-                            float hitDelta = Vector3Distance(ball.vel, prevBVel);
-                            if (hitDelta > 3.0f) {
-                                Vector3 hitPoint = Vector3Lerp(cars[mySlot].pos, ball.pos, 0.5f);
-                                Vector3 hitNorm = Vector3Normalize(Vector3Subtract(ball.pos, cars[mySlot].pos));
-                                particles_impact_burst(hitPoint, hitNorm, hitDelta);
-                            }
-                        }
-                    }
-
-                    /* 3. Reconcile local car with authoritative server target */
-                    if (netClient.players[mySlot].active) {
-                        Vector3 srvPos = V3(netClient.players[mySlot].targetPos.x, netClient.players[mySlot].targetPos.y, netClient.players[mySlot].targetPos.z);
-                        Vector3 srvVel = V3(netClient.players[mySlot].targetVel.x, netClient.players[mySlot].targetVel.y, netClient.players[mySlot].targetVel.z);
-                        Quaternion srvRot = (Quaternion){ netClient.players[mySlot].targetRot.x, netClient.players[mySlot].targetRot.y, netClient.players[mySlot].targetRot.z, netClient.players[mySlot].targetRot.w };
-                        float rotLenSq = srvRot.x*srvRot.x + srvRot.y*srvRot.y + srvRot.z*srvRot.z + srvRot.w*srvRot.w;
-
-                        if (!onlineFirstSnap) {
-                            cars[mySlot].pos = srvPos;
-                            cars[mySlot].vel = srvVel;
-                            if (rotLenSq > 0.5f) cars[mySlot].rot = srvRot;
-                            prevPos[mySlot] = srvPos;
-                            prevRot[mySlot] = cars[mySlot].rot;
-                            rcars[mySlot] = cars[mySlot];
-                            onlineFirstSnap = 1;
-                            camSnap = 1;
-                        } else {
-                            float latencySec = (netClient.pingMs * 0.5f) / 1000.0f;
-                            if (latencySec > 0.12f) latencySec = 0.12f;
-                            Vector3 srvProj = Vector3Add(srvPos, Vector3Scale(srvVel, latencySec));
-                            float errDist = Vector3Distance(cars[mySlot].pos, srvProj);
-
-                            if (errDist > 4.0f) {
-                                cars[mySlot].pos = srvPos;
-                                cars[mySlot].vel = srvVel;
-                                if (rotLenSq > 0.5f) cars[mySlot].rot = srvRot;
-                                camSnap = 1;
-                            } else if (Vector3Length(cars[mySlot].vel) < 0.8f) {
-                                if (errDist > 0.02f) cars[mySlot].pos = Vector3Lerp(cars[mySlot].pos, srvPos, 0.15f);
-                                cars[mySlot].vel = Vector3Lerp(cars[mySlot].vel, srvVel, 0.15f);
-                                if (rotLenSq > 0.5f) cars[mySlot].rot = QuaternionSlerp(cars[mySlot].rot, srvRot, 0.15f);
-                            } else if (errDist > 0.8f) {
-                                cars[mySlot].pos = Vector3Lerp(cars[mySlot].pos, srvProj, 0.04f);
-                            }
-                        }
-                        cars[mySlot].boost = netClient.players[mySlot].boost;
-                        cars[mySlot].demolished = netClient.players[mySlot].demolished;
-                        cars[mySlot].demoTimer = netClient.players[mySlot].demoTimer;
-                    }
-
-                    /* 4. Remote cars smooth interpolation */
-                    for (i = 0; i < SARP_MAX_CLIENTS; i++) {
-                        if (i == mySlot) continue;
-                        if (netClient.players[i].active) {
-                            if (carModel[i] != netClient.players[i].car_model) {
-                                load_car(CAR_NAMES[netClient.players[i].car_model % CAR_COUNT], &cars[i], &crs[i], lit, 1);
-                                carModel[i] = netClient.players[i].car_model % CAR_COUNT;
-                            }
-                            team[i] = netClient.players[i].team;
-                            Vector3 rPos = V3(netClient.players[i].targetPos.x, netClient.players[i].targetPos.y, netClient.players[i].targetPos.z);
-                            Vector3 rVel = V3(netClient.players[i].targetVel.x, netClient.players[i].targetVel.y, netClient.players[i].targetVel.z);
-                            Quaternion rRot = (Quaternion){ netClient.players[i].targetRot.x, netClient.players[i].targetRot.y, netClient.players[i].targetRot.z, netClient.players[i].targetRot.w };
-                            float rotLenSq = rRot.x*rRot.x + rRot.y*rRot.y + rRot.z*rRot.z + rRot.w*rRot.w;
-                            if (rotLenSq < 0.5f) rRot = (Quaternion){ 0, 0, 0, 1 };
-
-                            if (cars[i].pos.y < -100.0f || Vector3Distance(cars[i].pos, rPos) > 8.0f) {
-                                cars[i].pos = rPos;
-                                cars[i].vel = rVel;
-                                cars[i].rot = rRot;
-                                prevPos[i] = rPos;
-                                prevRot[i] = rRot;
-                            } else {
-                                cars[i].pos = Vector3Lerp(cars[i].pos, rPos, 0.40f);
-                                cars[i].vel = rVel;
-                                cars[i].rot = QuaternionSlerp(cars[i].rot, rRot, 0.40f);
-                            }
-                            cars[i].steerAngle = netClient.players[i].steerAngle;
-                            cars[i].wheelSpin = netClient.players[i].wheelSpin;
-                            cars[i].boost = netClient.players[i].boost;
-                            cars[i].demolished = netClient.players[i].demolished;
-                            cars[i].boosting = (Vector3Length(cars[i].vel) > 12.0f && cars[i].boost > 0.0f);
-                        } else {
-                            cars[i].pos = V3(0, -500, 0);
-                            cars[i].rot = (Quaternion){ 0, 0, 0, 1 };
-                        }
-                    }
-
-                    /* 5. Ball reconciliation */
-                    if (netClient.serverTick > 0) {
-                        Vector3 sbPos = V3(netClient.ballTargetPos.x, netClient.ballTargetPos.y, netClient.ballTargetPos.z);
-                        Vector3 sbVel = V3(netClient.ballTargetVel.x, netClient.ballTargetVel.y, netClient.ballTargetVel.z);
-                        Quaternion sbRot = (Quaternion){ netClient.ballTargetRot.x, netClient.ballTargetRot.y, netClient.ballTargetRot.z, netClient.ballTargetRot.w };
-                        float rotLenSq = sbRot.x*sbRot.x + sbRot.y*sbRot.y + sbRot.z*sbRot.z + sbRot.w*sbRot.w;
-                        if (rotLenSq < 0.5f) sbRot = (Quaternion){ 0, 0, 0, 1 };
-                        float bDist = Vector3Distance(ball.pos, sbPos);
-                        if (bDist > 5.0f || Vector3Length(ball.pos) < 0.1f) {
-                            ball.pos = sbPos;
-                            ball.vel = sbVel;
-                            ball.rot = sbRot;
-                        } else if (bDist > 0.05f) {
-                            ball.pos = Vector3Lerp(ball.pos, sbPos, 0.40f);
-                            ball.vel = Vector3Lerp(ball.vel, sbVel, 0.40f);
-                            ball.rot = QuaternionSlerp(ball.rot, sbRot, 0.40f);
-                        }
-                    }
-
-                    /* 6. Match state & scores */
-                    scoreBlue = netClient.scoreBlue;
-                    scoreOrange = netClient.scoreOrange;
-                    matchTime = netClient.serverMatchTime;
-                    if (netClient.serverGameState == 0) state = ST_COUNTDOWN;
-                    else if (netClient.serverGameState == 1) state = ST_PLAY;
-                    else if (netClient.serverGameState == 2) state = ST_GOAL;
-                    else if (netClient.serverGameState == 3) state = ST_OVER;
+                    /* ONLINE: predict the whole world one tick (our car with our input,
+                     * remote cars with their last known input, the ball), then record
+                     * our input + state so the next snapshot can rewind and replay. */
+                    online_step_world(cars, &ball, &netClient, &tick, h, 1);
+                    online_record(&netClient, &tick, &cars[mySlot]);
                 }
 
                 for (i = 0; i < activeCars; i++) {
@@ -3621,6 +3722,7 @@ int sarpbc_main(int argc, char **argv)
                 float alpha = clampf(acc * PHYS_HZ, 0.0f, 1.0f);
                 int activeCars = isOnline ? SARP_MAX_CLIENTS : nCars;
                 int mySlot = isOnline ? netClient.localSlot : 0;
+                if (isOnline) online_decay_visuals(dt, mySlot);
                 for (i = 0; i < activeCars; i++) {
                     if (isOnline && i != mySlot && !netClient.players[i].active) {
                         rcars[i].pos = V3(0, -500, 0);
@@ -3631,11 +3733,19 @@ int sarpbc_main(int argc, char **argv)
                         rcars[i].pos = Vector3Lerp(prevPos[i], cars[i].pos, alpha);
                         rcars[i].rot = QuaternionSlerp(prevRot[i], cars[i].rot, alpha);
                     }
+                    if (isOnline) {
+                        rcars[i].pos = Vector3Add(rcars[i].pos, g_on.visOfs[i]);
+                        rcars[i].rot = QuaternionNormalize(QuaternionMultiply(g_on.visRot[i], rcars[i].rot));
+                    }
                 }
                 rball = ball;
                 if (Vector3Distance(prevBallPos, ball.pos) < 8.0f) {
                     rball.pos = Vector3Lerp(prevBallPos, ball.pos, alpha);
                     rball.rot = QuaternionSlerp(prevBallRot, ball.rot, alpha);
+                }
+                if (isOnline) {
+                    rball.pos = Vector3Add(rball.pos, g_on.ballVisOfs);
+                    rball.rot = QuaternionNormalize(QuaternionMultiply(g_on.ballVisRot, rball.rot));
                 }
             }
 
@@ -4099,7 +4209,7 @@ int sarpbc_main(int argc, char **argv)
             net_client_poll(&netClient, dt);
             if (netClient.state == NET_CONNECTED) {
                 isOnline = 1;
-                onlineFirstSnap = 0;
+                online_reset();
                 int mySlot = netClient.localSlot;
                 carModel[mySlot] = g_set.car;
                 team[mySlot] = netClient.localTeam;

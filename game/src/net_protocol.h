@@ -5,10 +5,20 @@
 #include <string.h>
 
 #define SARP_NET_MAGIC      0x53415250   /* "SARP" */
-#define SARP_NET_VERSION    1
+#define SARP_NET_VERSION    2            /* v2: input queue + rollback state */
 #define SARP_DEFAULT_PORT   7777
 #define SARP_MAX_CLIENTS    8
 #define SARP_TICK_RATE      60
+
+/* NetCarState.flags */
+#define NCF_HAS_JUMPED   0x01
+#define NCF_HAS_FLIPPED  0x02
+#define NCF_BOOSTING     0x04
+
+/* NetCarState.in_buttons */
+#define NIB_JUMP         0x01
+#define NIB_BOOST        0x02
+#define NIB_SLIDE        0x04
 
 #pragma pack(push, 1)
 
@@ -123,11 +133,21 @@ typedef struct NetCarState {
     NetQuat  rot;
     float    steerAngle;
     float    wheelSpin;
+    /* Internal simulation state, so clients can resimulate/extrapolate exactly */
+    float    jumpTimer, flipTimer, airTime, landTimer, boostMinTimer, uprightTimer;
+    float    flipDirX, flipDirY;
+    uint8_t  flags;              /* NCF_* */
+    uint8_t  demo_tenths;        /* respawn countdown in 0.1 s units */
+    /* Last input the server applied to this car (for remote-car extrapolation) */
+    int8_t   in_throttle, in_steer, in_pitch, in_yaw, in_roll;
+    uint8_t  in_buttons;         /* NIB_* */
 } NetCarState;
 
 typedef struct PktServerState {
     NetHeader    header;
     uint32_t     server_tick;
+    uint32_t     ack_input_tick; /* last client input tick the server simulated (per recipient) */
+    float        state_timer;    /* countdown / goal-replay time remaining */
     uint8_t      game_state;     /* 0 = COUNTDOWN, 1 = PLAY, 2 = GOAL, 3 = OVER */
     float        match_time;     /* seconds remaining */
     uint8_t      score_blue;

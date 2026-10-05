@@ -35,6 +35,7 @@ typedef struct NetClient {
     NetClientState   state;
     char             serverIp[64];
     int              serverPort;
+    uint8_t          serverAddr[16];  /* resolved sockaddr_in (resolved once at connect) */
     char             playerName[24];
     int              preferredTeam;   /* 0 = Blue, 1 = Orange, 2 = Auto */
     int              localSlot;       /* 0..7 assigned by server */
@@ -43,11 +44,11 @@ typedef struct NetClient {
     int              skin;
     uint32_t         clientSeq;
     uint32_t         serverSeqAck;
-    uint32_t         clientTick;
+    uint32_t         clientTick;      /* number of the last input sent (= last predicted tick) */
     float            connectTimer;
     int              connectAttempts;
-    float            pingMs;
-    float            pingTimer;
+    float            pingMs;          /* smoothed round-trip time */
+    double           pingTimer;
     double           lastPacketTime;
     char             statusMsg[128];
     int              statusOk;        /* 0 = gray, 1 = yellow, 2 = green, 3 = red */
@@ -61,10 +62,23 @@ typedef struct NetClient {
 
     /* Authoritative match state */
     uint8_t          serverGameState; /* 0 = COUNTDOWN, 1 = PLAY, 2 = GOAL, 3 = OVER */
+    float            serverStateTimer;
     float            serverMatchTime;
     uint8_t          scoreBlue;
     uint8_t          scoreOrange;
     uint32_t         serverTick;
+
+    /* Latest raw snapshot, consumed by the game's rollback/reconcile step */
+    uint32_t         snapCount;       /* bumps every time a newer snapshot arrives */
+    uint32_t         snapAckTick;     /* last of OUR input ticks the server had simulated */
+    NetBallState     snapBall;
+    NetCarState      snapCars[SARP_MAX_CLIENTS];
+
+    /* Connection quality */
+    uint32_t         snapsReceived;
+    uint32_t         snapsLost;
+    uint32_t         snapsLate;       /* arrived out of order, discarded */
+    float            lossPct;         /* recent snapshot loss % */
 
     /* Players list */
     NetClientPlayer  players[SARP_MAX_CLIENTS];
@@ -77,6 +91,7 @@ typedef struct NetClient {
     float            goalBannerTimer;
 
     int              hasDemoEvent;
+    int              demoKillerId, demoVictimId;
     char             demoKiller[24];
     char             demoVictim[24];
     float            demoBannerTimer;
