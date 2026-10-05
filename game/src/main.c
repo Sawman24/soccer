@@ -53,561 +53,14 @@ typedef struct CarRender {
 typedef enum { ST_COUNTDOWN, ST_PLAY, ST_GOAL, ST_OVER } GameState;
 
 /* ------------------------------------------------------------------------ */
-/* Bots                                                                       */
+/* Bots (AI lives in bot_ai.h, shared with the dedicated server)             */
 /* ------------------------------------------------------------------------ */
 #define MAX_CARS 8
-#define PRED_DT  (1.0f / 30.0f)
-#define PRED_N   150                  /* 5 s of ball prediction */
-
-#define BOT_ACT_NONE   0
-#define BOT_ACT_JUMP   1              /* single jump for low-mid balls */
-#define BOT_ACT_DJUMP  2              /* double jump */
-#define BOT_ACT_DODGE  3              /* directional dodge / dash in any direction */
-#define BOT_ACT_AERIAL 4              /* rocket-boost flight in 3D */
-
-typedef struct Bot {
-    int     action;             /* BOT_ACT_* */
-    float   actionT;            /* timer within current action */
-    float   stuckT, reverseT;
-    Vector2 dodgeDir;           /* (steer, pitch) direction for dodge */
-    float   kickJitter;         /* random kickoff offset */
-    float   recoverT;           /* cooldown between recovery jumps */
-    int     role;               /* 0 attack, 1 defend, 2 support */
-    float   dashCooldown;       /* delay between speed-flip dashes */
-    Vector3 aerialTarget;       /* 3D target point in air */
-} Bot;
+#include "bot_ai.h"
 
 static const char *SKILL_NAMES[] = { "Rookie", "Pro", "All-Star" };
 static const char *MODE_NAMES[]  = { "Free play", "1 v 1", "2 v 2", "3 v 3" };
-
-/* Shared world knowledge, refreshed once per physics tick by bot_world_update(). */
-static Vector3 g_pred[PRED_N], g_predVel[PRED_N];   /* ball path, sample i = i*PRED_DT after g_predAge ago */
-static float   g_predAge = 0.0f;
-static int     g_predCalls = 0;
-static const Vector3 *g_botPads = NULL;
-static const float   *g_botPadTimer = NULL;
-static int            g_botPadCount = 0;
-
-static float flat_dist(Vector3 a, Vector3 b) { float dx = a.x - b.x, dz = a.z - b.z; return sqrtf(dx*dx + dz*dz); }
-static Vector3 flat_dir(Vector3 from, Vector3 to)
-{
-    Vector3 d = V3(to.x - from.x, 0, to.z - from.z);
-    float l = Vector3Length(d);
-    return l > 1e-4f ? Vector3Scale(d, 1.0f / l) : V3(0, 0, 1);
-}
-
-/* Steering helper: + = target is to the car's left. */
-static float bot_angle_to(const Car *c, Vector3 target)
-{
-    Vector3 l = car_to_local(c, Vector3Subtract(target, c->pos));
-    return atan2f(-l.z, l.x);
-}
-
-/* Re-simulate the ball's path when it was hit (velocity no longer matches the
- * prediction) and otherwise every few ticks. */
-static void bot_world_update(const Ball *b, float dt, const Vector3 *pads, const float *padTimer, int npads)
-{
-    int i, k;
-    Ball s = *b;
-    g_botPads = pads; g_botPadTimer = padTimer; g_botPadCount = npads;
-    g_predAge += dt;
-    k = (int)(g_predAge / PRED_DT + 0.5f);
-    if (g_predCalls++ > 0 && k < PRED_N - 30 && (g_predCalls % 6) != 0 &&
-        Vector3Distance(g_predVel[k], b->vel) < 1.5f)
-        return;
-    g_predAge = 0.0f;
-    for (i = 0; i < PRED_N; i++) {
-        g_pred[i] = s.pos; g_predVel[i] = s.vel;
-        ball_step(&s, PRED_DT * 0.5f);
-        ball_step(&s, PRED_DT * 0.5f);
-    }
-}
-
-static Vector3 pred_at(float t)
-{
-    float f = (t + g_predAge) / PRED_DT;
-    int i = (int)f;
-    if (i < 0) return g_pred[0];
-    if (i >= PRED_N - 1) return g_pred[PRED_N - 1];
-    return Vector3Lerp(g_pred[i], g_pred[i + 1], f - (float)i);
-}
-
-/* Straight-line distance the car can cover after i*PRED_DT (throttle + boost). */
-static void drive_cover(const Car *c, int useBoost, float *cov)
-{
-    float v = fmaxf(0.0f, Vector3DotProduct(c->vel, car_fwd(c))), d = 0.0f, bst = useBoost ? c->boost : 0.0f;
-    int i;
-    for (i = 0; i < PRED_N; i++) {
-        float a = throttle_accel(v);
-        cov[i] = d;
-        if (bst > 0.0f) { a += BOOST_ACCEL; bst -= PRED_DT; }
-        v = fminf(v + a * PRED_DT, CAR_MAX_SPEED);
-        d += v * PRED_DT;
-    }
-}
-
-typedef struct Intercept {
-    float   t;
-    Vector3 p;
-    int     ok;
-    int     isAerial;   /* 1 if high ball reachable by rocket boost flight */
-    int     isWall;     /* 1 if ball is on the arena wall / ramp */
-} Intercept;
-
-/* Earliest moment the car can get to the predicted ball (ground, wall, or aerial). */
-static Intercept find_intercept(const Car *c, int useBoost, float maxH, int skill)
-{
-    float cov[PRED_N];
-    Intercept r = { PRED_N * PRED_DT, g_pred[PRED_N - 1], 0, 0, 0 };
-    int i;
-    drive_cover(c, useBoost, cov);
-    for (i = 0; i < PRED_N; i++) {
-        float t = (float)i * PRED_DT - g_predAge, d, tt;
-        Vector3 p;
-        int k, onWall, canAerial;
-        if (t < 0.05f) continue;
-        p = pred_at(t);
-        if (p.y > maxH) continue;
-        onWall = (fabsf(p.x) > 60.0f || fabsf(p.z) > 113.0f) && p.y > 2.0f;
-        canAerial = (p.y > 4.2f && !onWall && ((skill == 1 && p.y <= 6.5f) || skill >= 2) && c->boost >= 0.40f);
-
-        if (canAerial) {
-            /* 3D aerial rocket flight reach check */
-            float dist3d = Vector3Distance(c->pos, p) - BALL_R;
-            float maxBoostT = fminf(t, c->boost);
-            float flightDist = fmaxf(0.0f, Vector3Length(c->vel)) * t + 0.5f * BOOST_ACCEL * maxBoostT * maxBoostT;
-            if (dist3d <= flightDist + 4.0f && t < 2.5f) {
-                r.t = t; r.p = p; r.ok = 1; r.isAerial = 1;
-                return r;
-            }
-        } else if (onWall) {
-            /* Wall ride intercept */
-            float dist3d = Vector3Distance(c->pos, p) - (BALL_R + 1.0f);
-            tt = t - fabsf(bot_angle_to(c, p)) * 0.25f;
-            k  = (int)(tt / PRED_DT);
-            if (dist3d <= 0.0f || (k >= 0 && cov[k < PRED_N ? k : PRED_N - 1] >= dist3d)) {
-                r.t = t; r.p = p; r.ok = 1; r.isWall = 1;
-                return r;
-            }
-        } else {
-            /* Ground/low intercept */
-            d  = flat_dist(c->pos, p) - (BALL_R + 1.0f);
-            tt = t - fabsf(bot_angle_to(c, p)) * 0.30f;
-            k  = (int)(tt / PRED_DT);
-            if (d <= 0.0f || (k >= 0 && cov[k < PRED_N ? k : PRED_N - 1] >= d)) {
-                r.t = t; r.p = p; r.ok = 1;
-                return r;
-            }
-        }
-    }
-    return r;
-}
-
-/* Intelligent boost pad routing: finds the best pad that adds minimal detour to target */
-static int best_pad(const Car *c, Vector3 target, float maxDetour)
-{
-    int i, best = -1;
-    float bestScore = 1e9f;
-    for (i = 0; i < g_botPadCount; i++) {
-        float dToPad, dPadToTgt, directDist, detour, score;
-        if (g_botPadTimer[i] > 0.5f) continue; /* must be active or about to respawn */
-        dToPad = flat_dist(c->pos, g_botPads[i]);
-        dPadToTgt = flat_dist(g_botPads[i], target);
-        directDist = flat_dist(c->pos, target);
-        detour = (dToPad + dPadToTgt) - directDist;
-        if (detour < maxDetour && dToPad < 65.0f) {
-            score = detour + dToPad * 0.35f;
-            if (score < bestScore) {
-                bestScore = score;
-                best = i;
-            }
-        }
-    }
-    return best;
-}
-
-/* team: 0 = blue (attacks +Z), 1 = orange (attacks -Z) */
-static Input bot_think(int self, Car *cars, const int *team, int n, const Ball *b, Bot *bt, int skill, float dt)
-{
-    Car *c = &cars[self];
-    Input in;
-    const float as = team[self] == 0 ? 1.0f : -1.0f;
-    const Vector3 goal = V3(0, 0, as * ARENA_L), own = V3(0, 0, -as * ARENA_L);
-    const float maxH = skill == 0 ? 3.0f : skill == 1 ? 8.5f : 20.0f;
-    float speed = Vector3Length(c->vel), vf = Vector3DotProduct(c->vel, car_fwd(c));
-    float bestT = 1e9f, defBest = 1e9f, arriveT = 0.0f, ang, dTarget, wUp, align = 0.0f;
-    int onGround = c->wheelsOnGround >= 3, i, attacker = self, defender = -1, shooting = 0, danger = 0;
-    int kickoff = fabsf(b->pos.x) < 0.01f && fabsf(b->pos.z) < 0.01f && Vector3Length(b->vel) < 0.1f;
-    Intercept me = find_intercept(c, skill >= 1, maxH, skill);
-    Vector3 target, I, dir = V3(0, 0, as);
-    memset(&in, 0, sizeof(in));
-
-    bt->dashCooldown -= dt;
-
-    /* if a high ball can drop to a clean bumper height very soon, wait unless an aerial or wall ride is better */
-    if (me.ok && me.p.y > 2.8f && !me.isWall && (skill == 0 || c->boost < 0.35f)) {
-        Intercept low = find_intercept(c, skill >= 1, 2.8f, skill);
-        if (low.ok && low.t < me.t + 1.2f) me = low;
-    }
-    I = me.p;
-    if (kickoff) {
-        if (bt->kickJitter == 0.0f) bt->kickJitter = (float)GetRandomValue(-100, 100) / 100.0f + 0.001f;
-        I.x += bt->kickJitter * 0.9f;
-    }
-
-    /* is the ball about to go into our net? */
-    for (i = 0; i < (int)(3.0f / PRED_DT); i++)
-        if (g_pred[i].z * as < -(ARENA_L - 1.0f) && fabsf(g_pred[i].x) < GOAL_HW + 2.5f) { danger = 1; break; }
-
-    /* --- roles: fastest to the ball attacks (with hysteresis), nearest our goal defends --- */
-    for (i = 0; i < n; i++) {
-        Intercept it;
-        float tq;
-        if (team[i] != team[self]) continue;
-        it = (i == self) ? me : find_intercept(&cars[i], cars[i].boost > 0.0f, (i == self ? maxH : 8.5f), skill);
-        tq = it.t;
-        if ((it.p.z - cars[i].pos.z) * as < -1.0f && !danger) tq += 1.2f;
-        if (i == self && bt->role == 0) tq -= 0.35f;   /* hysteresis keeps attacker focused */
-        if (tq < bestT) { bestT = tq; attacker = i; }
-    }
-    for (i = 0; i < n; i++) {
-        float dg;
-        if (team[i] != team[self] || i == attacker) continue;
-        dg = flat_dist(cars[i].pos, own);
-        if (dg < defBest) { defBest = dg; defender = i; }
-    }
-    bt->role = (self == attacker) ? 0 : ((self == defender) ? 1 : 2);
-    if (danger && (self == defender || me.t < bestT + 1.2f)) bt->role = 0;   /* everyone scrambles to save dangerous balls */
-
-    /* --- choose target position in 3D ----------------------------------------- */
-    if (bt->role == 0) {
-        if (me.isWall) {
-            /* Wall attack: drive directly to the ball on the wall */
-            target = I;
-            arriveT = me.ok ? me.t : 0.0f;
-            shooting = 1;
-        } else if (me.isAerial && skill >= 1 && c->boost >= 0.35f) {
-            /* Aerial attack: rocket flight directly to aerial interception point */
-            target = I;
-            arriveT = me.t;
-            shooting = 1;
-        } else {
-            /* Ground/low shot: aim for opponent goal corners */
-            float cornerX = (I.x > 0.0f ? 1.0f : -1.0f) * (GOAL_HW - 2.5f);
-            Vector3 aim = V3(cornerX, 1.6f, goal.z);
-            Vector3 carToI = flat_dir(c->pos, I);
-            dir = flat_dir(I, aim);
-            if (danger || (I.z - own.z) * as < 40.0f) {
-                /* Defensive clear: hit hard away from own goal */
-                Vector3 away = flat_dir(own, I);
-                dir = Vector3Normalize(Vector3Add(Vector3Scale(away, 0.7f), Vector3Scale(dir, 0.3f)));
-            }
-            align = Vector3DotProduct(carToI, dir);
-            if (align >= -0.2f) {
-                /* Aggressive attack directly through the ball */
-                Vector3 contact = Vector3Subtract(I, Vector3Scale(dir, BALL_R + 0.8f));
-                target = contact;
-                arriveT = me.ok ? me.t : 0.0f;
-                shooting = 1;
-            } else {
-                /* Behind the ball: cut in aggressively or tight loop */
-                float d = flat_dist(c->pos, I);
-                if (d < 12.0f) {
-                    target = Vector3Subtract(I, Vector3Scale(carToI, BALL_R + 0.5f));
-                    shooting = 1; arriveT = me.t;
-                } else {
-                    float side = c->pos.x > I.x ? 1.0f : -1.0f;
-                    target = V3(I.x + side * 6.0f, 0, I.z - as * 6.0f);
-                    shooting = 0;
-                }
-            }
-        }
-        /* Boost routing: if low on boost and not in an immediate shot, route via active pad */
-        if (!kickoff && skill >= 1 && c->boost < 1.6f && !me.isAerial && !me.isWall) {
-            int p = best_pad(c, target, (c->boost < 0.6f ? 28.0f : 14.0f));
-            if (p >= 0) target = g_botPads[p];
-        }
-    } else if (bt->role == 1) {
-        /* Goalkeeper / Last Man: defend goal, challenge when ball enters our half */
-        if (danger || (b->pos.z - own.z) * as < 55.0f) {
-            target = I;
-            shooting = 1;
-            arriveT = me.ok ? me.t : 0.0f;
-        } else {
-            Vector3 toBall = flat_dir(own, b->pos);
-            target = Vector3Add(own, Vector3Scale(toBall, 22.0f));
-            if (skill >= 1 && c->boost < 1.8f) {
-                int p = best_pad(c, target, 35.0f);
-                if (p >= 0) target = g_botPads[p];
-            }
-        }
-    } else {
-        /* Support / Second Man: shadow play closely (18-24 m), pounce on rebounds */
-        target = V3(b->pos.x * 0.65f, 0, b->pos.z - as * 20.0f);
-        if (skill >= 1 && c->boost < 2.0f) {
-            int p = best_pad(c, target, 35.0f);
-            if (p >= 0) target = g_botPads[p];
-        }
-    }
-
-    /* Arena boundary clamping: allow full height and full wall bounds */
-    if (me.isWall || c->pos.y > 2.0f || fabsf(c->pos.x) > 60.0f) {
-        target.x = clampf(target.x, -ARENA_W + 1.2f, ARENA_W - 1.2f);
-        target.z = clampf(target.z, -ARENA_L - GOAL_D + 2.0f, ARENA_L + GOAL_D - 2.0f);
-        target.y = clampf(target.y, 0.3f, ARENA_H - 2.0f);
-    } else {
-        target.x = clampf(target.x, -ARENA_W + 3.0f, ARENA_W - 3.0f);
-        target.z = clampf(target.z, -ARENA_L - 4.0f, ARENA_L + 4.0f);
-    }
-
-    /* --- drive & steering ----------------------------------------------------- */
-    ang = bot_angle_to(c, target);
-    dTarget = (target.y > 2.0f || c->pos.y > 2.0f) ? Vector3Distance(c->pos, target) : flat_dist(c->pos, target);
-    wUp = Vector3DotProduct(c->angVel, car_up(c));
-    in.steer = clampf(-(ang - wUp * 0.12f) * (skill == 0 ? 2.5f : 4.5f), -1.0f, 1.0f);
-    in.throttle = skill == 0 ? 0.85f : 1.0f;
-
-    /* 50/50 challenge: if an opponent is also rushing the ball, challenge aggressively! */
-    int challenge5050 = 0;
-    for (i = 0; i < n; i++) {
-        if (team[i] != team[self] && Vector3Distance(cars[i].pos, b->pos) < 18.0f &&
-            Vector3Distance(c->pos, b->pos) < 22.0f) {
-            challenge5050 = 1;
-            break;
-        }
-    }
-
-    /* --- powerslide to dramatically decrease turn radius on sharp turns or cutbacks --- */
-    if (onGround && skill >= 1) {
-        float turnMag = fabsf(ang);
-        int onWall = (car_up(c).y < 0.85f);
-        /* Powerslide when needing to turn sharply:
-         * At high speeds (> 16 m/s): steer angle is limited by MaxSteerAngleCurve, so turns > 26 deg require slide
-         * At mid speeds (> 8 m/s): turns > 38 deg require slide
-         * At lower speeds (> 2.5 m/s): turns > 52 deg whip around tightly */
-        float slideReq = (speed > 16.0f) ? 0.45f : (speed > 8.0f ? 0.65f : 0.90f);
-        if (onWall) slideReq = 1.15f;   /* preserve tyre adhesion on steep walls */
-        if (turnMag > slideReq && speed > 2.5f) {
-            in.slide = 1;
-            in.steer = -signf(ang);   /* full steering lock while sliding */
-            /* Feather throttle on severe cutbacks (> 110 deg) to let rear whip without washing wide */
-            if (turnMag > 1.9f && speed > 13.0f) in.throttle = 0.5f;
-        }
-    }
-
-    /* stuck against wall or post: reverse out */
-    if (onGround && speed < 1.5f && in.throttle > 0.0f) bt->stuckT += dt; else bt->stuckT = 0.0f;
-    if (bt->stuckT > 0.8f) { bt->reverseT = 0.6f; bt->stuckT = 0.0f; }
-    if (bt->reverseT > 0.0f) { bt->reverseT -= dt; in.throttle = -1.0f; in.steer = -in.steer; in.boost = 0; in.slide = 0; }
-
-    /* --- boost usage ---------------------------------------------------------- */
-    if (skill >= 1) {
-        if (kickoff) {
-            in.throttle = 1.0f;
-            in.boost = (fabsf(ang) < 0.45f && c->boost > 0.0f);
-        } else if (challenge5050 && bt->role == 0) {
-            in.throttle = 1.0f;
-            if (fabsf(ang) < 0.50f && c->boost > 0.0f) in.boost = 1;
-        } else if (me.isWall && c->pos.y < target.y - 2.0f && fabsf(ang) < 0.50f && c->boost > 0.15f) {
-            /* Aggressive boost climb up the wall to beat gravity */
-            in.boost = 1;
-        } else if (shooting && arriveT > 0.0f) {
-            float want = dTarget / fmaxf(arriveT, 0.05f);
-            if (want < vf - 6.0f) in.throttle = 0.0f;   /* light tap, never full brake */
-            if (fabsf(ang) < 0.45f && c->boost > 0.0f && (want > vf + 2.0f || dTarget > 14.0f))
-                in.boost = 1;
-        } else if (onGround && fabsf(ang) < 0.40f && c->boost > 0.0f && dTarget > 18.0f &&
-                   (bt->role == 0 || danger || c->boost > 1.0f)) {
-            in.boost = 1;
-        }
-        /* stop boosting if already at supersonic max speed */
-        if (speed > CAR_MAX_SPEED - 2.0f) in.boost = 0;
-    }
-
-    /* --- action triggers: dashing in all directions, jumps, and aerials ------- */
-    if (bt->action == BOT_ACT_NONE && (onGround || c->pos.y > 2.0f) && skill >= 1 && bt->dashCooldown <= 0.0f && c->landTimer <= 0.0f) {
-        float dI = Vector3Distance(c->pos, I), angI = bot_angle_to(c, I), h = I.y;
-        int onWallCar = (car_up(c).y < 0.85f && c->wheelsOnGround >= 3);
-        int canStrike = (challenge5050 || danger || me.isWall || (shooting && align > 0.40f));
-        float jumpReachDist = fmaxf(2.8f, vf * 0.22f + 0.6f);
-
-        if (me.isAerial && skill >= 1 && c->boost >= 0.40f && fabsf(angI) < 0.40f && !onWallCar && dI < 28.0f && me.t < 1.8f) {
-            /* Rocket flight / aerial in 3D: only for genuinely high balls when aligned and close */
-            bt->action = BOT_ACT_AERIAL;
-            bt->actionT = 0.0f;
-            bt->aerialTarget = me.p;
-            bt->dashCooldown = 2.5f;
-        } else if (onWallCar && me.isWall && dI < 4.8f) {
-            /* On wall: strike dodge directly into the wall ball */
-            Vector3 toB = car_to_local(c, Vector3Subtract(I, c->pos));
-            float mag = sqrtf(toB.x * toB.x + toB.z * toB.z);
-            float nx = mag > 0.1f ? clampf(toB.z / mag, -1.0f, 1.0f) : 0.0f;
-            float ny = mag > 0.1f ? clampf(toB.x / mag, -1.0f, 1.0f) : 1.0f;
-            bt->action = BOT_ACT_DODGE;
-            bt->actionT = 0.0f;
-            bt->dodgeDir = (Vector2){ nx, -ny };
-            bt->dashCooldown = 2.0f;
-        } else if (onGround && (bt->role == 0 || danger) && h > 3.2f && h <= 4.8f && fabsf(angI) < 0.25f && dI < jumpReachDist && !me.isWall) {
-            /* Single jump for mid balls: timed to hit ball at jump apex! (balls <= 3.2m hit cleanly on ground) */
-            bt->action = BOT_ACT_JUMP;
-            bt->actionT = 0.0f;
-            bt->dashCooldown = 1.8f;
-        } else if (onGround && (bt->role == 0 || danger) && h > 4.8f && h <= 7.2f && skill >= 2 && fabsf(angI) < 0.22f && dI < jumpReachDist && !me.isWall) {
-            /* Double jump: timed to hit ball at double-jump apex! */
-            bt->action = BOT_ACT_DJUMP;
-            bt->actionT = 0.0f;
-            bt->dashCooldown = 2.2f;
-        } else if (onGround && bt->role == 0 && canStrike && dI < 4.4f &&
-                   (h <= 3.2f || me.isWall) && speed > 8.0f && fabsf(angI) < 0.40f) {
-            /* Directional strike dodge directly into the ball at contact */
-            Vector3 toB = car_to_local(c, Vector3Subtract(I, c->pos));
-            float mag = sqrtf(toB.x * toB.x + toB.z * toB.z);
-            float nx = mag > 0.1f ? clampf(toB.z / mag, -1.0f, 1.0f) : 0.0f;
-            float ny = mag > 0.1f ? clampf(toB.x / mag, -1.0f, 1.0f) : 1.0f;
-            bt->action = BOT_ACT_DODGE;
-            bt->actionT = 0.0f;
-            bt->dodgeDir = (Vector2){ nx, -ny };
-            bt->dashCooldown = 2.5f;
-        } else if (onGround && bt->role == 0 && dI < 4.0f && fabsf(angI) > 0.85f && fabsf(angI) < 1.9f && speed > 9.0f) {
-            /* Side flip: lateral cut-off strike when ball crosses beside the car */
-            bt->action = BOT_ACT_DODGE;
-            bt->actionT = 0.0f;
-            bt->dodgeDir = (Vector2){ angI > 0 ? -1.0f : 1.0f, -0.3f };
-            bt->dashCooldown = 3.0f;
-        } else if (onGround && (bt->role == 1 || danger) && dTarget > 22.0f && fabsf(ang) > 2.5f && speed < 8.0f) {
-            /* Backward flip to rapidly retreat toward own half */
-            bt->action = BOT_ACT_DODGE;
-            bt->actionT = 0.0f;
-            bt->dodgeDir = (Vector2){ 0.0f, 1.0f };
-            bt->dashCooldown = 4.0f;
-        } else if (onGround && vf > 10.0f && dTarget > 35.0f && fabsf(ang) < 0.25f && c->boost < 0.35f && speed < 35.0f) {
-            /* Downfield speed-flip dash only when empty on boost */
-            bt->action = BOT_ACT_DODGE;
-            bt->actionT = 0.0f;
-            bt->dodgeDir = (Vector2){ clampf(-ang * 1.5f, -0.6f, 0.6f), -1.0f };
-            bt->dashCooldown = 5.0f;
-        }
-    }
-
-    /* --- execute current action ----------------------------------------------- */
-    if (bt->action == BOT_ACT_JUMP) {
-        float t = bt->actionT;
-        in.slide = 0;
-        in.jump = t < 0.20f;
-        in.jumpPressed = (t == 0.0f);
-        bt->actionT += dt;
-        if (bt->actionT > 1.0f || (t > 0.35f && onGround)) {
-            bt->action = BOT_ACT_NONE;
-            bt->dashCooldown = 1.2f;
-        }
-    } else if (bt->action == BOT_ACT_DJUMP) {
-        float t = bt->actionT;
-        in.slide = 0;
-        in.jump = t < 0.20f;
-        if (t == 0.0f) {
-            in.jumpPressed = 1;
-        } else if (t >= 0.22f && !c->hasFlipped && c->wheelsOnGround == 0) {
-            in.jumpPressed = 1;
-            in.jump = 1;
-            in.pitch = 0.0f;
-            in.steer = 0.0f;
-        }
-        bt->actionT += dt;
-        if (bt->actionT > 1.5f || (t > 0.40f && onGround)) {
-            bt->action = BOT_ACT_NONE;
-            bt->dashCooldown = 1.5f;
-        }
-    } else if (bt->action == BOT_ACT_DODGE) {
-        float t = bt->actionT;
-        in.slide = 0;
-        in.jump = t < 0.06f;
-        if (!c->hasFlipped) {
-            if (t == 0.0f) {
-                in.jumpPressed = 1;
-            } else if (t >= 0.08f && c->wheelsOnGround == 0) {
-                in.jumpPressed = 1;
-                in.pitch = bt->dodgeDir.y;
-                in.steer = bt->dodgeDir.x;
-            }
-        }
-        bt->actionT += dt;
-        if (bt->actionT > 0.85f || (t > 0.35f && onGround)) {
-            bt->action = BOT_ACT_NONE;
-            bt->dashCooldown = 1.5f;
-        }
-    } else if (bt->action == BOT_ACT_AERIAL) {
-        /* Rocket boost flight in 3D */
-        float t = bt->actionT;
-        Vector3 toTgt = Vector3Subtract(bt->aerialTarget, c->pos);
-        float dist3d = Vector3Length(toTgt);
-        float tRem = fmaxf(0.1f, me.t - t);
-        Vector3 vDes = Vector3Add(Vector3Scale(toTgt, 1.0f / tRem), V3(0, 0.5f * GRAVITY * tRem, 0));
-        Vector3 dV = Vector3Subtract(vDes, c->vel);
-        Vector3 tDir = Vector3Length(dV) > 0.1f ? Vector3Normalize(dV) : V3(0, 1, 0);
-        Vector3 L = car_to_local(c, tDir);
-        Vector3 w = car_to_local(c, c->angVel);
-        Vector3 u = car_to_local(c, V3(0, 1, 0));
-        float pitchErr, yawErr;
-        int isHigh = (bt->aerialTarget.y > 5.5f);
-
-        in.slide = 0;
-        /* Fast aerial launch:
-         * 1st jump off ground at t < 0.20s.
-         * For high balls (> 5.5m), 2nd jump double-tap with neutral stick at t in [0.10s, 0.15s]
-         * so it adds pure vertical impulse without triggering a backflip. */
-        in.jump = (t < 0.20f);
-        if (t == 0.0f) {
-            in.jumpPressed = 1;
-        } else if (isHigh && !c->hasFlipped && t >= 0.10f && t < 0.16f && c->wheelsOnGround == 0) {
-            in.jumpPressed = 1;
-            in.pitch = 0.0f;
-            in.steer = 0.0f;
-        }
-
-        /* Vector flight attitude: pitch, yaw, roll to point nose along thrust vector */
-        if (!in.jumpPressed) {
-            pitchErr = atan2f(L.y, L.x);
-            yawErr   = atan2f(L.z, L.x);
-            in.pitch = clampf(pitchErr * 4.2f - w.z * 0.24f, -1.0f, 1.0f);
-            in.yaw   = clampf(yawErr * 4.2f + w.y * 0.24f, -1.0f, 1.0f);
-            in.roll  = clampf(u.z * 2.8f - w.x * 0.20f, -1.0f, 1.0f);
-        }
-
-        /* Burn rocket boost when nose aligns with flight path */
-        if (L.x > 0.35f && c->boost > 0.0f && t > 0.06f) in.boost = 1;
-
-        /* Aerial strike when reaching ball: if flip still available, dodge through ball */
-        if (dist3d < 4.0f) {
-            if (!c->hasFlipped) {
-                in.jumpPressed = 1;
-                in.pitch = -1.0f;
-            }
-            bt->action = BOT_ACT_NONE;
-            bt->dashCooldown = 1.5f;
-        }
-        bt->actionT += dt;
-        if (bt->actionT > 3.0f || c->boost <= 0.0f || (t > 0.40f && onGround)) {
-            bt->action = BOT_ACT_NONE;
-            bt->dashCooldown = 1.5f;
-        }
-    }
-
-    /* --- air recovery: land on wheels, nose towards target when not flying ---- */
-    if (!onGround && c->flipTimer <= 0.0f && bt->action != BOT_ACT_DODGE && bt->action != BOT_ACT_AERIAL) {
-        Vector3 u = car_to_local(c, V3(0, 1, 0)), w = car_to_local(c, c->angVel);
-        in.pitch = clampf(-u.x * 3.0f - w.z * 0.35f, -1.0f, 1.0f);
-        in.roll  = (u.y < 0.0f && fabsf(u.z) < 0.3f) ? 1.0f : clampf(u.z * 3.0f - w.x * 0.3f, -1.0f, 1.0f);
-        in.yaw   = clampf(-ang * 1.5f, -1.0f, 1.0f);
-    }
-
-    /* stuck on roof or side: jump to self-right */
-    bt->recoverT -= dt;
-    if (c->stuckTimer > 0.15f && bt->recoverT <= 0.0f) {
-        in.jumpPressed = 1; in.jump = 1; bt->recoverT = 0.5f; bt->action = BOT_ACT_NONE;
-    }
-
-    return in;
-}
+static const char *PLAYLIST_LABELS[] = { "QUICK MATCH", "DUEL 1v1", "DOUBLES 2v2", "STANDARD 3v3" };
 
 
 /* ------------------------------------------------------------------------ */
@@ -631,8 +84,11 @@ typedef struct Settings {
     int   mode, botSkill;               /* MODE_NAMES / SKILL_NAMES index */
     int   shadows, bloom;               /* graphics toggles */
     int   skin;                         /* 0 = Team, 1 = Custom */
+    char  name[24];                     /* online player name */
+    char  server[64];                   /* quick-match server address (host or host:port) */
+    int   playlist;                     /* last quick-match playlist: players per team */
 } Settings;
-static Settings g_set = { 4.6f, 0.44f, 75.0f, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1 };
+static Settings g_set = { 4.6f, 0.44f, 75.0f, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, "Striker", "127.0.0.1", 2 };
 
 static void settings_path(char *out, size_t n) {
     if (FileExists("settings.ini")) snprintf(out, n, "settings.ini");
@@ -648,6 +104,11 @@ static void settings_load(void)
     if (!(f = fopen(path, "r"))) return;
     while (fgets(line, sizeof(line), f)) {
         float v;
+        if (!strncmp(line, "player_name=", 12)) {   /* may contain spaces */
+            snprintf(g_set.name, sizeof(g_set.name), "%.19s", line + 12);
+            g_set.name[strcspn(g_set.name, "\r\n")] = 0;
+            continue;
+        }
         if (sscanf(line, " %63[^= ] = %63s", key, sv) != 2) continue;
         v = (float)atof(sv);
         if      (!strcmp(key, "camera_distance")) g_set.camDist     = clampf(v, 3.0f, 14.0f);
@@ -664,6 +125,8 @@ static void settings_load(void)
         else if (!strcmp(key, "shadows"))         g_set.shadows     = v != 0;
         else if (!strcmp(key, "bloom"))           g_set.bloom       = v != 0;
         else if (!strcmp(key, "skin"))            g_set.skin        = (int)clampf(v, 0, 1);
+        else if (!strcmp(key, "playlist"))        g_set.playlist    = (int)clampf(v, 1, 3);
+        else if (!strcmp(key, "server"))          snprintf(g_set.server, sizeof(g_set.server), "%s", sv);
         else if (!strcmp(key, "car"))
             for (i = 0; i < CAR_COUNT; i++) if (!strcmp(sv, CAR_NAMES[i])) g_set.car = i;
     }
@@ -678,10 +141,11 @@ static void settings_save(void)
     if (!(f = fopen(path, "w"))) return;
     fprintf(f, "camera_distance=%.2f\ncamera_height=%.2f\nfov=%.0f\nboost_fov=%d\nmatch_length=%d\n"
                "invert_pitch=%d\nfullscreen=%d\nshow_fps=%d\nshow_hints=%d\ncar=%s\nmode=%d\nbot_skill=%d\n"
-               "shadows=%d\nbloom=%d\nskin=%d\n",
+               "shadows=%d\nbloom=%d\nskin=%d\nplaylist=%d\nserver=%s\nplayer_name=%s\n",
             g_set.camDist, g_set.camHeight, g_set.fov, g_set.boostFov, g_set.matchIdx,
             g_set.invertPitch, g_set.fullscreen, g_set.showFps, g_set.showHints, CAR_NAMES[g_set.car],
-            g_set.mode, g_set.botSkill, g_set.shadows, g_set.bloom, g_set.skin);
+            g_set.mode, g_set.botSkill, g_set.shadows, g_set.bloom, g_set.skin,
+            g_set.playlist, g_set.server[0] ? g_set.server : "127.0.0.1", g_set.name);
     fclose(f);
 }
 
@@ -2440,7 +1904,7 @@ static void run_physics_test(Car *c)
                 cs[0] = *c; memset(bs, 0, sizeof(bs)); memset(tpt, 0, sizeof(tpt));
                 car_reset(&cs[0], V3(0, 0, -KICKOFF_Z), -PI / 2.0f);
                 ball_reset(&b); b.pos = V3(spots[trial][0], spots[trial][1], spots[trial][2]);
-                g_predCalls = 0;
+                g_bw->predCalls = 0;
                 for (t = 0; t < 30.0f; t += 1.0f / PHYS_HZ) {
                     Input bi;
                     bot_world_update(&b, 1.0f / PHYS_HZ, tp, tpt, 6);
@@ -2473,7 +1937,7 @@ static void run_physics_test(Car *c)
             sk[1] = skill < 3 ? skill : 0;
             for (m = 0; m < 4; m++) cs[m] = *c;
 #define BOT_KICKOFF() do { for (m = 0; m < 4; m++) { Vector3 p_; float y_; kickoff_spot(m % 2, tm[m], 2, &p_, &y_); car_reset(&cs[m], p_, y_); } \
-                           memset(bs, 0, sizeof(bs)); memset(tpt, 0, sizeof(tpt)); ball_reset(&b); g_predCalls = 0; } while (0)
+                           memset(bs, 0, sizeof(bs)); memset(tpt, 0, sizeof(tpt)); ball_reset(&b); g_bw->predCalls = 0; } while (0)
             BOT_KICKOFF();
             for (k = 0; k < (int)(180.0f * PHYS_HZ); k++) {
                 int q;
@@ -2547,21 +2011,34 @@ static int load_car(const char *name, Car *car, CarRender *cr, Shader lit, int r
 /* ------------------------------------------------------------------------ */
 /* Menus                                                                      */
 /* ------------------------------------------------------------------------ */
-typedef enum { SCR_MENU, SCR_ONLINE_JOIN, SCR_SETTINGS, SCR_GAME, SCR_PAUSE } Screen;
+typedef enum {
+    SCR_MENU,        /* main menu                                   */
+    SCR_PLAY,        /* online / offline choice                     */
+    SCR_ONLINE,      /* quick match: playlist + server              */
+    SCR_SEARCHING,   /* in the quick-match queue                    */
+    SCR_OFFLINE,     /* exhibition vs bots / free play              */
+    SCR_GARAGE,      /* car + paint                                 */
+    SCR_SETTINGS,
+    SCR_GAME,
+    SCR_PAUSE
+} Screen;
 
 typedef struct Nav { int up, down, left, right, ok, back; } Nav;
+
+static int g_navTextMode = 0;   /* a text box has focus: letters type instead of navigating */
 
 static Nav read_nav(void)
 {
     static int stickHeld = 0;
+    int letters = !g_navTextMode;
     Nav n;
     memset(&n, 0, sizeof(n));
-    n.up    = IsKeyPressed(KEY_UP)    || IsKeyPressed(KEY_W);
-    n.down  = IsKeyPressed(KEY_DOWN)  || IsKeyPressed(KEY_S);
-    n.left  = IsKeyPressed(KEY_LEFT)  || IsKeyPressed(KEY_A);
-    n.right = IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D);
-    n.ok    = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_SPACE);
-    n.back  = IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE);
+    n.up    = IsKeyPressed(KEY_UP)    || (letters && IsKeyPressed(KEY_W));
+    n.down  = IsKeyPressed(KEY_DOWN)  || (letters && IsKeyPressed(KEY_S)) || (!letters && IsKeyPressed(KEY_TAB));
+    n.left  = IsKeyPressed(KEY_LEFT)  || (letters && IsKeyPressed(KEY_A));
+    n.right = IsKeyPressed(KEY_RIGHT) || (letters && IsKeyPressed(KEY_D));
+    n.ok    = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || (letters && IsKeyPressed(KEY_SPACE));
+    n.back  = IsKeyPressed(KEY_ESCAPE) || (letters && IsKeyPressed(KEY_BACKSPACE));
     if (IsGamepadAvailable(0)) {
         float gx = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X);
         float gy = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_Y);
@@ -2742,8 +2219,10 @@ static Texture2D make_tech_ball_texture(void)
 /* Modern Stadium Broadcast Scoreboard */
 static void draw_hud_scoreboard(int sw, int scoreBlue, int scoreOrange, float matchTime, float matchLen, GameState state)
 {
-    int mins = (int)ceilf(fmaxf(0.0f, matchTime)) / 60, secs = (int)ceilf(fmaxf(0.0f, matchTime)) % 60;
-    const char *clock = matchLen > 0.0f ? TextFormat("%d:%02d", mins, secs) : "FREE";
+    int ot = matchTime < 0.0f;   /* online overtime: the server counts up as a negative time */
+    int tsec = ot ? (int)floorf(-matchTime) : (int)ceilf(fmaxf(0.0f, matchTime));
+    int mins = tsec / 60, secs = tsec % 60;
+    const char *clock = ot ? TextFormat("+%d:%02d", mins, secs) : matchLen > 0.0f ? TextFormat("%d:%02d", mins, secs) : "FREE";
     if (state == ST_OVER && scoreBlue == scoreOrange) clock = "+0:00";
 
     int totalW = 380, totalH = 54;
@@ -2778,7 +2257,12 @@ static void draw_hud_scoreboard(int sw, int scoreBlue, int scoreOrange, float ma
     DrawRectangleRoundedLinesEx(clockPod, 0.25f, 6, 1.0f, (Color){ 32, 44, 64, 200 });
 
     Color clockCol = RAYWHITE;
-    if (matchTime < 30.0f && matchLen > 0.0f) {
+    if (ot) {
+        Rectangle otr = { (float)(sw / 2 - 60), (float)(y0 + totalH + 6), 120, 24 };
+        DrawRectangleRounded(otr, 0.5f, 6, (Color){ 200, 40, 30, 235 });
+        DrawText("OVERTIME", (int)(otr.x + 60 - MeasureText("OVERTIME", 15) / 2), (int)otr.y + 5, 15, RAYWHITE);
+    }
+    if (!ot && matchTime < 30.0f && matchLen > 0.0f) {
         float pulse = 0.5f + 0.5f * sinf((float)GetTime() * 8.0f);
         clockCol = ColorAlpha((Color){ 255, 180, 60, 255 }, 0.7f + 0.3f * pulse);
     }
@@ -2982,6 +2466,284 @@ static void menu_run(const char *title, MenuItem *it, int n, int *sel, Nav nav, 
 }
 
 /* ------------------------------------------------------------------------ */
+/* Front-end UI: immediate-mode widgets. Mouse hover/click plus keyboard and  */
+/* gamepad focus that moves spatially (up/down/left/right picks the nearest   */
+/* widget in that direction, using last frame's layout).                      */
+/* ------------------------------------------------------------------------ */
+#define UI_MAX 48
+enum { UIK_BUTTON = 0, UIK_SPINNER, UIK_TEXT };
+
+typedef struct UiState {
+    int       screen, focus, count, prevCount;
+    Rectangle rect[UI_MAX], prevRect[UI_MAX];
+    int       kind[UI_MAX], prevKind[UI_MAX];
+    int       activated, adjustId, adjust;
+    Vector2   lastMouse;
+    int       mouseMoved;
+    float     t;
+} UiState;
+static UiState g_ui = { .screen = -1 };
+
+#define UI_ACCENT      (Color){ 255, 150, 30, 255 }
+#define UI_ACCENT_HI   (Color){ 255, 214, 110, 255 }
+#define UI_PANEL       (Color){ 12, 16, 26, 232 }
+#define UI_PANEL_LINE  (Color){ 45, 70, 110, 210 }
+#define UI_TEXT        (Color){ 228, 234, 245, 255 }
+#define UI_TEXT_DIM    (Color){ 150, 166, 190, 230 }
+#define UI_BLUE        (Color){ 60, 150, 255, 255 }
+#define UI_ORANGE      (Color){ 255, 140, 40, 255 }
+
+static void ui_begin(int screenId, Nav nav, int defaultFocus)
+{
+    Vector2 m = GetMousePosition();
+    int dir, j, best = -1;
+    float bestScore = 1e9f;
+    if (screenId != g_ui.screen) {
+        g_ui.screen = screenId;
+        g_ui.focus = defaultFocus;
+        g_ui.prevCount = 0;
+    } else {
+        g_ui.prevCount = g_ui.count;
+        memcpy(g_ui.prevRect, g_ui.rect, sizeof(g_ui.rect));
+        memcpy(g_ui.prevKind, g_ui.kind, sizeof(g_ui.kind));
+    }
+    g_ui.count = 0;
+    g_ui.activated = g_ui.adjustId = -1;
+    g_ui.adjust = 0;
+    g_ui.mouseMoved = m.x != g_ui.lastMouse.x || m.y != g_ui.lastMouse.y;
+    g_ui.lastMouse = m;
+    g_ui.t += GetFrameTime();
+    if (g_ui.prevCount == 0) return;
+    if (g_ui.focus < 0 || g_ui.focus >= g_ui.prevCount) g_ui.focus = 0;
+    if (g_ui.prevKind[g_ui.focus] != UIK_TEXT) while (GetCharPressed() > 0) {}   /* drop stray typing */
+
+    dir = nav.up ? 0 : nav.down ? 1 : nav.left ? 2 : nav.right ? 3 : -1;
+    if (dir >= 2 && g_ui.prevKind[g_ui.focus] == UIK_SPINNER) {
+        g_ui.adjustId = g_ui.focus; g_ui.adjust = dir == 2 ? -1 : 1;
+        dir = -1;
+    }
+    if (dir >= 0) {
+        Rectangle a = g_ui.prevRect[g_ui.focus];
+        float ax = a.x + a.width * 0.5f, ay = a.y + a.height * 0.5f;
+        for (j = 0; j < g_ui.prevCount; j++) {
+            Rectangle b = g_ui.prevRect[j];
+            float dx, dy, prim, sec, score;
+            if (j == g_ui.focus) continue;
+            dx = b.x + b.width * 0.5f - ax; dy = b.y + b.height * 0.5f - ay;
+            prim = dir == 0 ? -dy : dir == 1 ? dy : dir == 2 ? -dx : dx;
+            sec  = dir < 2 ? fabsf(dx) : fabsf(dy);
+            if (prim <= 1.0f) continue;
+            score = prim + sec * 2.0f;
+            if (score < bestScore) { bestScore = score; best = j; }
+        }
+        if (best >= 0) g_ui.focus = best;
+        else if (dir < 2) g_ui.focus = dir == 0 ? g_ui.prevCount - 1 : 0;   /* wrap */
+    }
+    if (nav.ok) {
+        if (g_ui.prevKind[g_ui.focus] == UIK_SPINNER) { g_ui.adjustId = g_ui.focus; g_ui.adjust = 1; }
+        else if (g_ui.prevKind[g_ui.focus] == UIK_BUTTON) g_ui.activated = g_ui.focus;
+    }
+}
+
+static int ui_add(Rectangle r, int kind)
+{
+    Vector2 m = GetMousePosition();
+    int id = g_ui.count < UI_MAX ? g_ui.count++ : UI_MAX - 1;
+    int hover = CheckCollisionPointRec(m, r);
+    g_ui.rect[id] = r;
+    g_ui.kind[id] = kind;
+    if (hover && g_ui.mouseMoved) g_ui.focus = id;
+    if (hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        g_ui.focus = id;
+        if (kind == UIK_SPINNER) { g_ui.adjustId = id; g_ui.adjust = m.x < r.x + r.width * 0.5f ? -1 : 1; }
+        else if (kind == UIK_BUTTON) g_ui.activated = id;
+    }
+    if (hover && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && kind == UIK_SPINNER) { g_ui.adjustId = id; g_ui.adjust = -1; }
+    return id;
+}
+
+static void ui_end(void)
+{
+    g_navTextMode = g_ui.focus >= 0 && g_ui.focus < g_ui.count && g_ui.kind[g_ui.focus] == UIK_TEXT;
+}
+
+static void ui_panel(Rectangle r, float round, Color fill, Color line)
+{
+    DrawRectangleRounded((Rectangle){ r.x + 3, r.y + 5, r.width, r.height }, round, 8, (Color){ 0, 0, 0, 120 });
+    DrawRectangleRounded(r, round, 8, fill);
+    if (line.a) DrawRectangleRoundedLinesEx(r, round, 8, 1.5f, line);
+}
+
+static void ui_text(const char *t, int x, int y, int fs, Color c)
+{
+    DrawText(t, x + 2, y + 2, fs, (Color){ 0, 0, 0, (unsigned char)(c.a * 0.7f) });
+    DrawText(t, x, y, fs, c);
+}
+
+static void ui_text_c(const char *t, float cx, int y, int fs, Color c)
+{
+    ui_text(t, (int)(cx - MeasureText(t, fs) * 0.5f), y, fs, c);
+}
+
+/* Big menu button. Returns 1 when clicked / confirmed. */
+static int ui_button(Rectangle r, const char *label, const char *sub, int primary)
+{
+    int id = ui_add(r, UIK_BUTTON), on = id == g_ui.focus;
+    int fs = r.height >= 60 ? 28 : r.height >= 46 ? 22 : 18;
+    int ty = (int)(r.y + r.height * 0.5f - (sub ? fs * 0.5f + 9 : fs * 0.5f));
+    float round = r.height > 80 ? 0.12f : 0.25f;
+    if (on) {
+        ui_panel(r, round, (Color){ 255, 140, 25, 245 }, UI_ACCENT_HI);
+        DrawRectangleRounded((Rectangle){ r.x + 4, r.y + 4, r.width - 8, r.height * 0.42f }, round, 8, (Color){ 255, 255, 255, 34 });
+        DrawText(label, (int)r.x + 26, ty, fs, (Color){ 15, 12, 8, 255 });
+        if (sub) DrawText(sub, (int)r.x + 26, ty + fs + 4, 15, (Color){ 50, 30, 10, 235 });
+        DrawText(">", (int)(r.x + r.width - 30), (int)(r.y + r.height * 0.5f - 12), 24, (Color){ 15, 12, 8, 255 });
+    } else {
+        ui_panel(r, round, (Color){ 16, 22, 34, 225 }, primary ? (Color){ 255, 150, 40, 200 } : (Color){ 40, 56, 82, 190 });
+        DrawRectangleRounded((Rectangle){ r.x + 8, r.y + 10, 4, r.height - 20 }, 0.6f, 4, primary ? UI_ACCENT : (Color){ 70, 120, 200, 200 });
+        ui_text(label, (int)r.x + 26, ty, fs, UI_TEXT);
+        if (sub) DrawText(sub, (int)r.x + 26, ty + fs + 4, 15, UI_TEXT_DIM);
+    }
+    return g_ui.activated == id;
+}
+
+/* "< value >" selector. Returns -1 / +1 when changed. */
+static int ui_spinner(Rectangle r, const char *label, const char *value)
+{
+    int id = ui_add(r, UIK_SPINNER), on = id == g_ui.focus;
+    int fs = r.height >= 50 ? 22 : 19;
+    const char *v = TextFormat("<   %s   >", value);
+    int vw = MeasureText(v, fs - 1);
+    if (on) {
+        ui_panel(r, 0.25f, (Color){ 255, 140, 25, 240 }, UI_ACCENT_HI);
+        DrawText(label, (int)r.x + 22, (int)(r.y + r.height * 0.5f - fs * 0.5f), fs, (Color){ 15, 12, 8, 255 });
+        DrawText(v, (int)(r.x + r.width - 20 - vw), (int)(r.y + r.height * 0.5f - (fs - 1) * 0.5f), fs - 1, (Color){ 15, 12, 8, 255 });
+    } else {
+        ui_panel(r, 0.25f, (Color){ 16, 22, 34, 220 }, (Color){ 40, 56, 82, 180 });
+        ui_text(label, (int)r.x + 22, (int)(r.y + r.height * 0.5f - fs * 0.5f), fs, UI_TEXT);
+        DrawText(v, (int)(r.x + r.width - 20 - vw), (int)(r.y + r.height * 0.5f - (fs - 1) * 0.5f), fs - 1, UI_ACCENT);
+    }
+    return g_ui.adjustId == id ? g_ui.adjust : 0;
+}
+
+/* Editable text box (mode 0 = name, 1 = host[:port]). */
+static void ui_textfield(Rectangle r, const char *label, char *buf, int maxlen, int mode)
+{
+    int id = ui_add(r, UIK_TEXT), on = id == g_ui.focus, len = (int)strlen(buf);
+    if (on) {
+        int key;
+        while ((key = GetCharPressed()) > 0) {
+            int ok = mode == 0 ? (key >= 32 && key <= 126)
+                               : ((key >= '0' && key <= '9') || (key >= 'a' && key <= 'z') || (key >= 'A' && key <= 'Z') ||
+                                  key == '.' || key == ':' || key == '-' || key == '_');
+            if (ok && len < maxlen - 1) { buf[len++] = (char)key; buf[len] = 0; }
+        }
+        if ((IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) && len > 0) buf[--len] = 0;
+    }
+    ui_panel(r, 0.22f, on ? (Color){ 24, 32, 48, 245 } : (Color){ 16, 22, 34, 220 }, on ? UI_ACCENT : (Color){ 40, 56, 82, 180 });
+    DrawText(label, (int)r.x + 18, (int)r.y + 9, 14, on ? UI_ACCENT : UI_TEXT_DIM);
+    ui_text(buf[0] ? buf : (on ? "" : "-"), (int)r.x + 18, (int)r.y + 28, 22, UI_TEXT);
+    if (on && fmodf(g_ui.t, 1.0f) < 0.55f)
+        DrawRectangle((int)r.x + 20 + MeasureText(buf, 22), (int)r.y + 28, 3, 22, UI_ACCENT);
+    if (on) DrawText("type to edit", (int)(r.x + r.width - 18 - MeasureText("type to edit", 13)), (int)r.y + 10, 13, UI_TEXT_DIM);
+}
+
+/* Little stick figures for playlist cards. */
+static void ui_people(float cx, float y, int perTeam, float s)
+{
+    int k;
+    float gap = 22.0f * s, half = perTeam * gap;
+    for (k = 0; k < perTeam; k++) {
+        float bx = cx - 26.0f * s - half + gap * (k + 0.5f), ox = cx + 26.0f * s + gap * (k + 0.5f);
+        DrawCircle((int)bx, (int)y, 7 * s, UI_BLUE);
+        DrawRectangleRounded((Rectangle){ bx - 9 * s, y + 9 * s, 18 * s, 20 * s }, 0.5f, 4, UI_BLUE);
+        DrawCircle((int)ox, (int)y, 7 * s, UI_ORANGE);
+        DrawRectangleRounded((Rectangle){ ox - 9 * s, y + 9 * s, 18 * s, 20 * s }, 0.5f, 4, UI_ORANGE);
+    }
+    DrawText("VS", (int)(cx - MeasureText("VS", (int)(16 * s)) * 0.5f), (int)(y + 4 * s), (int)(16 * s), UI_TEXT_DIM);
+}
+
+/* Large selectable card (playlists, play modes). Returns 1 when clicked / confirmed. */
+static int ui_card(Rectangle r, const char *title, const char *tag, const char *desc, int selected, int people)
+{
+    int id = ui_add(r, UIK_BUTTON), on = id == g_ui.focus;
+    Rectangle d = r;
+    if (on) d.y -= 6;
+    ui_panel(d, 0.08f, selected ? (Color){ 26, 34, 52, 245 } : UI_PANEL,
+             on ? UI_ACCENT_HI : selected ? UI_ACCENT : UI_PANEL_LINE);
+    if (selected || on) {
+        DrawRectangleRounded((Rectangle){ d.x + 2, d.y + 2, d.width - 4, 8 }, 1.0f, 4, on ? UI_ACCENT_HI : UI_ACCENT);
+        DrawRectangleRoundedLinesEx(d, 0.08f, 8, on ? 3.0f : 2.0f, on ? UI_ACCENT_HI : UI_ACCENT);
+    }
+    if (tag) {
+        int tw = MeasureText(tag, 14) + 18;
+        DrawRectangleRounded((Rectangle){ d.x + d.width - tw - 14, d.y + 18, (float)tw, 22 }, 0.5f, 4,
+                             selected ? UI_ACCENT : (Color){ 40, 56, 82, 230 });
+        DrawText(tag, (int)(d.x + d.width - tw - 5), (int)d.y + 22, 14, selected ? (Color){ 20, 14, 6, 255 } : UI_TEXT);
+    }
+    if (people > 0) ui_people(d.x + d.width * 0.5f, d.y + 78, people, 1.25f);
+    ui_text(title, (int)d.x + 22, (int)(d.y + (people > 0 ? 136 : 62)), 32, selected || on ? UI_ACCENT_HI : UI_TEXT);
+    if (desc) DrawText(desc, (int)d.x + 22, (int)(d.y + (people > 0 ? 178 : 106)), 16, UI_TEXT_DIM);
+    return g_ui.activated == id;
+}
+
+/* Screen title band + bottom hint bar shared by every menu page. */
+static void ui_chrome(const char *title, const char *crumb, const char *hints)
+{
+    int sw = GetScreenWidth(), sh = GetScreenHeight();
+    DrawRectangleGradientV(0, 0, sw, 150, (Color){ 4, 6, 12, 235 }, (Color){ 4, 6, 12, 0 });
+    DrawRectangleGradientV(0, sh - 90, sw, 90, (Color){ 4, 6, 12, 0 }, (Color){ 4, 6, 12, 235 });
+    if (title) {
+        int tw = MeasureText(title, 46);
+        ui_text(title, 64, 38, 46, UI_TEXT);
+        DrawRectangle(64, 90, tw, 4, UI_ACCENT);
+        if (crumb) DrawText(crumb, 64 + tw + 22, 56, 18, UI_TEXT_DIM);
+    }
+    if (hints) DrawText(hints, 64, sh - 38, 16, UI_TEXT_DIM);
+}
+
+/* Player card (bottom right on menu pages). */
+static void ui_profile(const char *name, const char *car, const char *paint)
+{
+    int sw = GetScreenWidth(), sh = GetScreenHeight();
+    Rectangle r = { (float)sw - 330, (float)sh - 108, 290, 72 };
+    ui_panel(r, 0.2f, UI_PANEL, UI_PANEL_LINE);
+    DrawCircle((int)r.x + 36, (int)r.y + 36, 22, (Color){ 30, 60, 110, 255 });
+    DrawCircleLines((int)r.x + 36, (int)r.y + 36, 22, UI_ACCENT);
+    DrawText(TextFormat("%c", name[0] ? name[0] : '?'), (int)r.x + 36 - MeasureText(TextFormat("%c", name[0] ? name[0] : '?'), 24) / 2,
+             (int)r.y + 24, 24, UI_TEXT);
+    ui_text(name[0] ? name : "Player", (int)r.x + 72, (int)r.y + 14, 22, UI_TEXT);
+    DrawText(TextFormat("%s  -  %s", car, paint), (int)r.x + 72, (int)r.y + 42, 15, UI_TEXT_DIM);
+}
+
+/* Rotating "searching" spinner. */
+static void ui_spinner_anim(Vector2 c, float r, float t)
+{
+    int k;
+    DrawRing(c, r - 6, r, 0, 360, 48, (Color){ 30, 40, 60, 220 });
+    for (k = 0; k < 3; k++) {
+        float a0 = t * 240.0f + k * 120.0f;
+        DrawRing(c, r - 6, r, a0, a0 + 50.0f, 16, k == 0 ? UI_ACCENT : k == 1 ? UI_BLUE : UI_ORANGE);
+    }
+}
+
+/* "host", "host:port" -> host + port (default port when missing). */
+static void split_host_port(const char *in, char *host, int hostLen, int *port)
+{
+    const char *c = strrchr(in, ':');
+    *port = SARP_DEFAULT_PORT;
+    if (c && c != in && strchr(in, ':') == c && c[1]) {
+        int n = (int)(c - in);
+        if (n >= hostLen) n = hostLen - 1;
+        memcpy(host, in, (size_t)n); host[n] = 0;
+        *port = atoi(c + 1);
+        if (*port <= 0 || *port > 65535) *port = SARP_DEFAULT_PORT;
+    } else {
+        snprintf(host, (size_t)hostLen, "%s", in[0] ? in : "127.0.0.1");
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Online Multiplayer HUD & Scoreboard                                       */
 /* ------------------------------------------------------------------------ */
 static void net_client_draw_nameplates(const NetClient *cli, const Vector3 *carPositions, const int *carTeams, const int *demolished, Camera3D cam)
@@ -3004,7 +2766,7 @@ static void net_client_draw_nameplates(const NetClient *cli, const Vector3 *carP
         Vector2 sp = GetWorldToScreen(headPos, cam);
         if (sp.x < -100 || sp.x > sw + 100 || sp.y < -100 || sp.y > sh + 100) continue;
 
-        const char *name = cli->players[i].name;
+        const char *name = cli->players[i].isBot ? TextFormat("%s  BOT", cli->players[i].name) : cli->players[i].name;
         int fontSize = dist < 40.0f ? 16 : dist < 90.0f ? 14 : 12;
         int tw = MeasureText(name, fontSize);
         int padX = 10, padY = 5;
@@ -3031,7 +2793,7 @@ static void net_client_draw_scoreboard(const NetClient *cli, int sw, int sh)
     DrawRectangleRounded((Rectangle){ (float)px, (float)py, (float)panelW, (float)panelH }, 0.15f, 6, (Color){ 12, 16, 26, 240 });
     DrawRectangleRoundedLinesEx((Rectangle){ (float)px, (float)py, (float)panelW, (float)panelH }, 0.15f, 6, 2.0f, (Color){ 45, 75, 120, 220 });
 
-    DrawText("ONLINE MATCH SCOREBOARD", px + 24, py + 16, 22, (Color){ 255, 185, 50, 255 });
+    DrawText(cli->serverPlaylist == 1 ? "DUEL 1v1" : cli->serverPlaylist == 3 ? "STANDARD 3v3" : "DOUBLES 2v2", px + 24, py + 16, 22, (Color){ 255, 185, 50, 255 });
     const char *srvInfo = TextFormat("%s:%d  |  Ping: %.0f ms", cli->serverIp, cli->serverPort, cli->pingMs);
     DrawText(srvInfo, px + panelW - MeasureText(srvInfo, 14) - 24, py + 22, 14, (Color){ 170, 195, 225, 220 });
     DrawRectangle(px + 24, py + 48, panelW - 48, 1, (Color){ 45, 65, 95, 180 });
@@ -3060,6 +2822,7 @@ static void net_client_draw_scoreboard(const NetClient *cli, int sw, int sh)
 
         const char *pName = cli->players[i].name;
         if (isLocal) pName = TextFormat("%s (YOU)", pName);
+        else if (cli->players[i].isBot) pName = TextFormat("%s [BOT]", pName);
         DrawText(pName, rx + 12, ry + 7, 15, isLocal ? (Color){ 255, 225, 120, 255 } : RAYWHITE);
 
         const char *carStr = CAR_NAMES[cli->players[i].car_model % CAR_COUNT];
@@ -3314,7 +3077,7 @@ int sarpbc_main(int argc, char **argv)
     float matchLen = MATCH_TIME, matchTime = MATCH_TIME, stateTimer = 3.0f, acc = 0.0f, fov = 60.0f, menuT = 0.0f;
     GameState state = ST_COUNTDOWN;
     Screen screen = SCR_MENU, settingsFrom = SCR_MENU;
-    int menuSel = 0, setSel = 0, pauseSel = 0, quit = 0;
+    int setSel = 0, quit = 0;
     Input in = { 0 };
     int pendingJump = 0, testMode = 0, shotMode = 0, frameNo = 0;
     /* render interpolation + camera state */
@@ -3325,9 +3088,9 @@ int sarpbc_main(int argc, char **argv)
     float camY = 0.0f;
     int camSnap = 1;
     NetClient netClient;
-    int isOnline = 0, onlineSel = 4, prefTeamSel = 2, autoConnect = 0;
-    char customIpInput[32] = "127.0.0.1";
-    char playerNameInput[24] = "Striker";
+    int isOnline = 0, autoConnect = 0;
+    const char *connectArg = NULL, *nameArg = NULL;
+    char onlineMsg[128] = "";          /* shown on the quick-match page (errors, match results) */
 
     memset(crs, 0, sizeof(crs));
     memset(bots, 0, sizeof(bots));
@@ -3345,15 +3108,20 @@ int sarpbc_main(int argc, char **argv)
         else if (strcmp(argv[i], "--ballshot") == 0) shotMode = 4;
         else if (strcmp(argv[i], "--connect") == 0 && i + 1 < argc) {
             autoConnect = 1;
-            strncpy(customIpInput, argv[++i], sizeof(customIpInput) - 1);
+            connectArg = argv[++i];
         }
         else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
-            strncpy(playerNameInput, argv[++i], sizeof(playerNameInput) - 1);
+            nameArg = argv[++i];
         }
         else if (strncmp(argv[i], "--", 2) != 0) carArg = argv[i];
     }
 
     if (!testMode) settings_load();
+    if (connectArg) snprintf(g_set.server, sizeof(g_set.server), "%s", connectArg);
+    if (nameArg) snprintf(g_set.name, sizeof(g_set.name), "%.19s", nameArg);
+    if (!g_set.name[0]) snprintf(g_set.name, sizeof(g_set.name), "Striker");
+    if (!g_set.server[0]) snprintf(g_set.server, sizeof(g_set.server), "127.0.0.1");
+    if (g_set.playlist < 1 || g_set.playlist > 3) g_set.playlist = 2;
     if (carArg) {
         for (i = 0; i < CAR_COUNT; i++) if (!strcmp(carArg, CAR_NAMES[i])) g_set.car = i;
     }
@@ -3445,6 +3213,8 @@ int sarpbc_main(int argc, char **argv)
     char demoBannerText[64] = { 0 };
     Color demoBannerColor = ORANGE;
     float camShake = 0.0f;
+    float matchFoundTimer = 0.0f;       /* "MATCH FOUND" banner after joining a quick match */
+    int carAdj = 0;                     /* garage car change, applied after drawing */
 
     NEW_MATCH();
     for (i = 0; i < MAX_CARS; i++) rcars[i] = cars[i];
@@ -3455,23 +3225,75 @@ int sarpbc_main(int argc, char **argv)
     cam.fovy = fov;
     cam.projection = CAMERA_PERSPECTIVE;
     if (shotMode == 1) screen = SCR_GAME;
-    if (autoConnect) {
-        net_client_connect(&netClient, customIpInput, netClient.serverPort, playerNameInput, g_set.car, g_set.skin, prefTeamSel);
-        screen = SCR_ONLINE_JOIN;
-    }
+    /* start searching the selected playlist on the configured server */
+#define START_SEARCH() do { char host_[64]; int port_; \
+        split_host_port(g_set.server, host_, sizeof(host_), &port_); \
+        onlineMsg[0] = 0; settings_save(); \
+        net_client_connect(&netClient, host_, port_, g_set.name, g_set.car, g_set.skin, g_set.playlist); \
+        screen = SCR_SEARCHING; } while (0)
+    /* back to offline state after an online match (restores our car in slot 0 for the menus) */
+#define LEAVE_ONLINE() do { isOnline = 0; \
+        if (carModel[0] != g_set.car && load_car(CAR_NAMES[g_set.car], &cars[0], &crs[0], lit, 1)) carModel[0] = g_set.car; \
+        carModel[0] = g_set.car; NEW_MATCH(); camSnap = 1; } while (0)
+    if (autoConnect) START_SEARCH();
 
+    enum { UA_NONE, UA_GO_MENU, UA_GO_PLAY, UA_GO_ONLINE, UA_GO_OFFLINE, UA_GO_GARAGE, UA_GO_SETTINGS, UA_QUIT,
+           UA_FIND_MATCH, UA_CANCEL_SEARCH, UA_START_OFFLINE, UA_RESUME, UA_PAUSE_SETTINGS, UA_RESTART,
+           UA_LEAVE_MATCH, UA_REQUEUE, UA_POST_MENU };
     while (!quit && !WindowShouldClose()) {
         float dt = fminf(GetFrameTime(), 0.1f);
         Screen screenAtStart = screen;
         Nav nav = read_nav();
-        int act = -1, adj = 0;
+        int act = -1, adj = 0, uiAct = UA_NONE;
 
         /* ================= game update ================= */
+        g_navTextMode = 0;   /* re-armed by ui_end() if a text box still has focus */
         if (isOnline) {
             net_client_poll(&netClient, dt);
             if (netClient.state == NET_DISCONNECTED) {
-                isOnline = 0;
-                screen = SCR_MENU;
+                /* match over (server sent everyone back) or connection lost */
+                snprintf(onlineMsg, sizeof(onlineMsg), "%s", netClient.disconnectReason == DISC_MATCH_OVER
+                         ? "Match complete. Ready for another one?" : netClient.statusMsg);
+                LEAVE_ONLINE();
+                screen = SCR_ONLINE;
+            }
+        }
+        if (screen == SCR_SEARCHING) {
+            net_client_poll(&netClient, dt);
+            if (netClient.state == NET_DISCONNECTED) {
+                snprintf(onlineMsg, sizeof(onlineMsg), "%s", netClient.statusMsg);
+                screen = SCR_ONLINE;
+            } else if (netClient.state == NET_CONNECTED) {
+                /* MATCH FOUND: switch the world over to the server's match */
+                int mySlot = netClient.localSlot;
+                isOnline = 1;
+                online_reset();
+                for (i = 0; i < SARP_MAX_CLIENTS; i++) {
+                    if (i == mySlot) continue;
+                    cars[i].pos = V3(0, -500, 0);
+                    cars[i].vel = V3(0, 0, 0);
+                    cars[i].rot = (Quaternion){ 0, 0, 0, 1 };
+                    cars[i].demolished = 0;
+                }
+                if (carModel[mySlot] != g_set.car) load_car(CAR_NAMES[g_set.car], &cars[mySlot], &crs[mySlot], lit, 1);
+                carModel[mySlot] = g_set.car;
+                team[mySlot] = netClient.localTeam;
+                {
+                    Vector3 kp; float ky;
+                    kickoff_spot(mySlot % (netClient.playlist > 0 ? netClient.playlist : 1), team[mySlot], netClient.playlist, &kp, &ky);
+                    car_reset(&cars[mySlot], kp, ky);
+                }
+                for (i = 0; i < SARP_MAX_CLIENTS; i++) { prevPos[i] = cars[i].pos; prevRot[i] = cars[i].rot; rcars[i] = cars[i]; }
+                ball_reset(&ball);
+                prevBallPos = ball.pos; prevBallRot = ball.rot; rball = ball;
+                for (i = 0; i < PAD_COUNT; i++) padTimer[i] = 0.0f;
+                memset(g_particles, 0, sizeof(g_particles)); g_particleHead = 0;
+                scoreBlue = scoreOrange = 0;
+                matchLen = MATCH_TIME; matchTime = MATCH_TIME;
+                state = ST_COUNTDOWN; stateTimer = 5.0f;
+                acc = 0.0f; pendingJump = 0; camSnap = 1; demoBannerTimer = 0.0f; camShake = 0.0f;
+                matchFoundTimer = 2.5f;
+                screen = SCR_GAME;
             }
         }
         if (isOnline) {
@@ -3525,7 +3347,7 @@ int sarpbc_main(int argc, char **argv)
 
             if (screen == SCR_GAME && (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_P) ||
                 (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT)))) {
-                screen = SCR_PAUSE; pauseSel = 0;
+                screen = SCR_PAUSE;
             }
             if (shotMode) {
                 if (frameNo == 0) { state = ST_PLAY; cars[0].boost = BOOST_MAX; }
@@ -3790,18 +3612,31 @@ int sarpbc_main(int argc, char **argv)
                 fov = Lerp(fov, g_set.fov + (pc->boosting && g_set.boostFov ? 8.0f : 0.0f), 1.0f - expf(-4.0f * dt));
                 cam.fovy = fov;
             }
-        } else if (screen == SCR_MENU || screen == SCR_ONLINE_JOIN || (screen == SCR_SETTINGS && settingsFrom == SCR_MENU)) {
-            /* menu backdrop: parked car, slow orbit */
+        } else if (screen != SCR_PAUSE && !(screen == SCR_SETTINGS && settingsFrom == SCR_PAUSE)) {
+            /* menu backdrop: parked car, slow orbit, framed right of centre so the menus sit on the left */
             float a;
+            Vector3 fwd_, side_;
             menuT += dt;
             a = menuT * 0.18f;
             car_reset(&cars[0], V3(0, 0, -KICKOFF_Z), -PI / 2.0f + menuT * 0.35f);
             cam.target   = Vector3Add(cars[0].pos, V3(0, 0.7f, 0));
             cam.position = Vector3Add(cars[0].pos, V3(sinf(a) * 7.5f, 2.4f, cosf(a) * 7.5f));
+            fwd_  = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
+            side_ = Vector3Normalize(Vector3CrossProduct(fwd_, V3(0, 1, 0)));
+            if (screen != SCR_SEARCHING) {
+                cam.position = Vector3Subtract(cam.position, Vector3Scale(side_, 2.6f));
+                cam.target   = Vector3Subtract(cam.target, Vector3Scale(side_, 2.6f));
+            }
             cam.fovy = fov = 50.0f;
             for (i = 0; i < nCars; i++) rcars[i] = cars[i];
             rball = ball;
-            if (shotMode == 2 && ++frameNo == 60) { TakeScreenshot("menu.png"); quit = 1; }
+            if (shotMode == 2 && ++frameNo % 60 == 0) {   /* --menushot: one capture per front-end screen */
+                static const int shotScr[] = { SCR_MENU, SCR_PLAY, SCR_ONLINE, SCR_OFFLINE, SCR_GARAGE };
+                static const char *shotName[] = { "menu.png", "menu_play.png", "menu_online.png", "menu_offline.png", "menu_garage.png" };
+                int k = frameNo / 60 - 1;
+                TakeScreenshot(shotName[k]);
+                if (k + 1 < 5) screen = shotScr[k + 1]; else quit = 1;
+            }
             if (shotMode == 3) {   /* --carshot: 4 views, 90 deg apart */
                 int view = frameNo / 20;
                 car_reset(&cars[0], V3(0, 0, -KICKOFF_Z), 0.0f);
@@ -3981,8 +3816,8 @@ int sarpbc_main(int argc, char **argv)
             draw_hud_boost_and_speed(sw, sh, rcars[mySlot].boost, speed, rcars[mySlot].boosting);
             draw_hud_tactical_badges(sw, sh, ballCam,
                                      CAR_NAMES[isOnline ? netClient.players[mySlot].car_model : g_set.car],
-                                     isOnline ? (team[mySlot] == 0 ? "BLUE TEAM" : "ORANGE TEAM") : MODE_NAMES[g_set.mode],
-                                     isOnline ? "DEDICATED SERVER" : SKILL_NAMES[botSkill],
+                                     isOnline ? PLAYLIST_LABELS[netClient.playlist % 4] : MODE_NAMES[g_set.mode],
+                                     isOnline ? (team[mySlot] == 0 ? "BLUE TEAM" : "ORANGE TEAM") : SKILL_NAMES[botSkill],
                                      g_set.showFps, g_set.showHints && screen == SCR_GAME);
 
             if (!isOnline) {
@@ -4035,8 +3870,21 @@ int sarpbc_main(int argc, char **argv)
                     DrawText(respawnMsg, sw/2 - rw/2, ry + 8, 28, (Color){ 245, 245, 250, 245 });
                 }
 
+                if (matchFoundTimer > 0.0f) {
+                    float al = fminf(1.0f, matchFoundTimer * 1.5f);
+                    const char *mf = "MATCH FOUND";
+                    matchFoundTimer -= dt;
+                    DrawRectangle(0, sh / 2 - 270, sw, 76, (Color){ 6, 10, 18, (unsigned char)(200 * al) });
+                    DrawRectangle(0, sh / 2 - 270, sw, 3, ColorAlpha(UI_ACCENT, al));
+                    DrawRectangle(0, sh / 2 - 197, sw, 3, ColorAlpha(UI_ACCENT, al));
+                    DrawText(mf, sw / 2 - MeasureText(mf, 52) / 2, sh / 2 - 258, 52, ColorAlpha(UI_ACCENT_HI, al));
+                }
                 if (state == ST_COUNTDOWN) {
                     const char *t = TextFormat("%d", (int)ceilf(stateTimer));
+                    if (isOnline) {
+                        const char *pl = TextFormat("QUICK MATCH  -  %s", PLAYLIST_LABELS[netClient.playlist % 4]);
+                        ui_text_c(pl, sw * 0.5f, sh / 2 - 182, 22, UI_TEXT);
+                    }
                     int tw = MeasureText(t, 84);
                     int cdR = 58;
                     DrawCircle(sw/2 + 2, sh/2 - 95 + 3, cdR, (Color){ 0, 0, 0, 140 });
@@ -4058,215 +3906,293 @@ int sarpbc_main(int argc, char **argv)
                     DrawRectangle(bx + 20, by + bH - 5, bW - 40, 3, teamBorder);
                     DrawText(t, sw/2 - gw/2 + 2, by + 8 + 2, 58, (Color){ 0, 0, 0, 220 });
                     DrawText(t, sw/2 - gw/2, by + 8, 58, teamGlow);
-                } else if (state == ST_OVER) {
-                    const char *t = scoreBlue > scoreOrange ? "BLUE WINS!" : scoreOrange > scoreBlue ? "ORANGE WINS!" : "DRAW!";
-                    int ow = MeasureText(t, 58);
-                    int bW = ow + 110, bH = 100;
-                    int bx = sw/2 - bW/2, by = sh/2 - 130;
-                    DrawRectangleRounded((Rectangle){ (float)bx, (float)by, (float)bW, (float)bH }, 0.20f, 6, (Color){ 10, 14, 22, 245 });
-                    DrawRectangleRoundedLinesEx((Rectangle){ (float)bx, (float)by, (float)bW, (float)bH }, 0.20f, 6, 2.0f, (Color){ 255, 180, 50, 240 });
-                    DrawText(t, sw/2 - ow/2, by + 12, 58, RAYWHITE);
-                    const char *sub = "PRESS [R] TO PLAY AGAIN";
-                    int sww = MeasureText(sub, 20);
-                    DrawText(sub, sw/2 - sww/2, by + 74, 20, (Color){ 255, 190, 80, 240 });
                 }
             }
         }
 
-        /* --- menus (logic runs here so hit-testing matches what's drawn) -- */
+        /* --- front-end screens (immediate mode: drawn and hit-tested together) --- */
         if (screen != screenAtStart) memset(&nav, 0, sizeof(nav));   /* don't let the key that opened a menu also act in it */
-        if (screen == SCR_MENU && shotMode != 3 && shotMode != 4) {
-            MenuItem it[8];
-            int sw = GetScreenWidth();
-            memset(it, 0, sizeof(it));
-            it[0].label = "LOCAL PLAY";
-            it[1].label = "ONLINE MULTIPLAYER";
-            it[2].label = "CAR";      snprintf(it[2].value, sizeof(it[2].value), "%s", CAR_NAMES[g_set.car]);
-            it[3].label = "SKIN";     snprintf(it[3].value, sizeof(it[3].value), "%s", g_set.skin ? CAR_SKIN_NAMES[g_set.car] : "Team (Default)");
-            it[4].label = "MODE";     snprintf(it[4].value, sizeof(it[4].value), "%s", MODE_NAMES[g_set.mode]);
-            it[5].label = "BOTS";     snprintf(it[5].value, sizeof(it[5].value), "%s", SKILL_NAMES[g_set.botSkill]);
-            it[6].label = "SETTINGS";
-            it[7].label = "QUIT";
-            menu_run("", it, 8, &menuSel, nav, &act, &adj);
-            const char *t1 = "SUPERSONIC ACROBATIC";
-            const char *t2 = "ROCKET-POWERED BATTLE-CARS";
-            const char *t3 = "CHAMPIONSHIP EDITION";
-            int w1 = MeasureText(t1, 48);
-            int w2 = MeasureText(t2, 48);
-            int w3 = MeasureText(t3, 18);
-            DrawText(t1, sw/2 - w1/2 + 2, 50 + 2, 48, (Color){ 0, 0, 0, 200 });
-            DrawText(t1, sw/2 - w1/2, 50, 48, (Color){ 255, 175, 45, 255 });
-            DrawText(t2, sw/2 - w2/2 + 2, 102 + 2, 48, (Color){ 0, 0, 0, 200 });
-            DrawText(t2, sw/2 - w2/2, 102, 48, (Color){ 255, 140, 25, 255 });
-            DrawText(t3, sw/2 - w3/2, 158, 18, (Color){ 180, 215, 255, 230 });
-        } else if (screen == SCR_ONLINE_JOIN) {
-            MenuItem it[6];
-            memset(it, 0, sizeof(it));
-            it[0].label = "SERVER IP";      snprintf(it[0].value, sizeof(it[0].value), "%s", customIpInput);
-            it[1].label = "SERVER PORT";    snprintf(it[1].value, sizeof(it[1].value), "%d", netClient.serverPort);
-            it[2].label = "PLAYER NAME";    snprintf(it[2].value, sizeof(it[2].value), "%s", playerNameInput);
-            it[3].label = "TEAM";           snprintf(it[3].value, sizeof(it[3].value), "%s", prefTeamSel == 0 ? "Blue" : prefTeamSel == 1 ? "Orange" : "Auto-Balance");
-            it[4].label = netClient.state == NET_CONNECTING ? "CONNECTING..." : "CONNECT TO SERVER";
-            it[5].label = "BACK TO MENU";
-            menu_run("ONLINE MULTIPLAYER", it, 6, &onlineSel, nav, &act, &adj);
-
+        {
             int sw = GetScreenWidth(), sh = GetScreenHeight();
-            int stw = MeasureText(netClient.statusMsg, 18);
-            Color statusColor = netClient.statusOk == 2 ? GREEN :
-                                netClient.statusOk == 1 ? YELLOW :
-                                netClient.statusOk == 3 ? RED : GRAY;
-            DrawText(netClient.statusMsg, sw / 2 - stw / 2, sh / 2 + 190, 18, statusColor);
-            DrawText("Tip: Use A/D to cycle presets, or type to edit IP/Name",
-                     sw / 2 - MeasureText("Tip: Use A/D to cycle presets, or type to edit IP/Name", 14) / 2,
-                     sh / 2 + 218, 14, (Color){ 160, 180, 205, 200 });
-        } else if (screen == SCR_PAUSE) {
-            MenuItem it[5];
-            memset(it, 0, sizeof(it));
-            it[0].label = "RESUME";
-            it[1].label = isOnline ? "LEAVE MATCH" : "RESTART MATCH";
-            it[2].label = "SETTINGS";
-            it[3].label = "MAIN MENU";
-            it[4].label = "QUIT GAME";
-            menu_run("PAUSED", it, 5, &pauseSel, nav, &act, &adj);
-        } else if (screen == SCR_SETTINGS) {
-            MenuItem it[13];
-            memset(it, 0, sizeof(it));
-            it[0].label = "CAMERA DISTANCE";  snprintf(it[0].value, 48, "%.1f m", g_set.camDist);
-            it[1].label = "CAMERA HEIGHT";    snprintf(it[1].value, 48, "%.2f", g_set.camHeight);
-            it[2].label = "FIELD OF VIEW";    snprintf(it[2].value, 48, "%.0f", g_set.fov);
-            it[3].label = "BOOST FOV KICK";   snprintf(it[3].value, 48, "%s", g_set.boostFov ? "On" : "Off");
-            it[4].label = "MATCH LENGTH";     snprintf(it[4].value, 48, "%s", MATCH_NAMES[g_set.matchIdx]);
-            it[5].label = "INVERT AIR PITCH"; snprintf(it[5].value, 48, "%s", g_set.invertPitch ? "On" : "Off");
-            it[6].label = "FULLSCREEN";       snprintf(it[6].value, 48, "%s", g_set.fullscreen ? "On" : "Off");
-            it[7].label = "SHOW FPS";         snprintf(it[7].value, 48, "%s", g_set.showFps ? "On" : "Off");
-            it[8].label = "SHOW CONTROLS";    snprintf(it[8].value, 48, "%s", g_set.showHints ? "On" : "Off");
-            it[9].label = "SHADOWS";          snprintf(it[9].value, 48, "%s", g_set.shadows ? "On" : "Off");
-            it[10].label = "BLOOM";           snprintf(it[10].value, 48, "%s", g_set.bloom ? "On" : "Off");
-            it[11].label = "USE ORIGINAL CAMERA"; snprintf(it[11].value, 48, "5.4 m / 59");
-            it[12].label = "BACK";
-            menu_run("SETTINGS", it, 13, &setSel, nav, &act, &adj);
-            if (setSel == 4 && settingsFrom == SCR_PAUSE)
-                DrawText("match length applies to the next match", GetScreenWidth()/2 - MeasureText("match length applies to the next match", 18)/2,
-                         GetScreenHeight() - 70, 18, (Color){ 255, 190, 120, 255 });
+            const char *paintName = g_set.skin ? CAR_SKIN_NAMES[g_set.car] : "Team colours";
+            const char *hints = "ARROWS / WASD / D-PAD  Move     ENTER / A  Select     ESC / B  Back";
+
+            if (screen == SCR_MENU && shotMode != 3 && shotMode != 4) {
+                float bx = 64, by = sh * 0.37f, bw = 440, bh = 72, gap = 14;
+                ui_begin(SCR_MENU, nav, 0);
+                DrawRectangleGradientH(0, 0, (int)(sw * 0.6f), sh, (Color){ 4, 6, 12, 220 }, (Color){ 4, 6, 12, 0 });
+                ui_chrome(NULL, NULL, hints);
+                ui_text("SUPERSONIC ACROBATIC", 66, 52, 28, UI_ACCENT);
+                ui_text("ROCKET-POWERED", 64, 86, 58, UI_TEXT);
+                ui_text("BATTLE-CARS", 64, 146, 58, UI_TEXT);
+                DrawRectangle(66, 214, 300, 3, UI_ACCENT);
+                DrawText("CHAMPIONSHIP EDITION", 66, 226, 18, (Color){ 180, 215, 255, 230 });
+                if (ui_button((Rectangle){ bx, by, bw, bh }, "PLAY", "Quick Match  -  Exhibition  -  Free Play", 1)) uiAct = UA_GO_PLAY;
+                if (ui_button((Rectangle){ bx, by + (bh + gap), bw, bh }, "GARAGE", "Choose your car and paint", 0)) uiAct = UA_GO_GARAGE;
+                if (ui_button((Rectangle){ bx, by + 2 * (bh + gap), bw, bh }, "SETTINGS", "Camera, controls and graphics", 0)) uiAct = UA_GO_SETTINGS;
+                if (ui_button((Rectangle){ bx, by + 3 * (bh + gap), bw, 56 }, "EXIT", NULL, 0)) uiAct = UA_QUIT;
+                ui_profile(g_set.name, CAR_NAMES[g_set.car], paintName);
+                ui_end();
+            } else if (screen == SCR_PLAY) {
+                float cw = fminf(440.0f, (sw - 200) * 0.5f), ch = 320, cy = sh * 0.5f - 170, cx = sw * 0.5f - cw - 22;
+                ui_begin(SCR_PLAY, nav, 0);
+                DrawRectangle(0, 0, sw, sh, (Color){ 0, 0, 0, 110 });
+                ui_chrome("PLAY", "Choose how you want to play", hints);
+                if (ui_card((Rectangle){ cx, cy, cw, ch }, "QUICK MATCH", "ONLINE",
+                            "Get matched with other players in\n1v1, 2v2 or 3v3. If nobody else\nis around, bots fill the empty seats.", 1, 2))
+                    uiAct = UA_GO_ONLINE;
+                if (ui_card((Rectangle){ cx + cw + 44, cy, cw, ch }, "EXHIBITION", "OFFLINE",
+                            "Play a match against bots of your\nchosen difficulty, or warm up in\nfree play.", 0, 1))
+                    uiAct = UA_GO_OFFLINE;
+                if (ui_button((Rectangle){ 64, (float)sh - 150, 220, 52 }, "BACK", NULL, 0) || nav.back) uiAct = UA_GO_MENU;
+                ui_profile(g_set.name, CAR_NAMES[g_set.car], paintName);
+                ui_end();
+            } else if (screen == SCR_ONLINE) {
+                static const char *plTitle[] = { "", "DUEL", "DOUBLES", "STANDARD" };
+                static const char *plTag[]   = { "", "1v1", "2v2", "3v3" };
+                static const char *plDesc[]  = { "", "Just you and one opponent.\nNo teammates, no excuses.",
+                                                     "Team up with a partner.\nThe classic way to play.",
+                                                     "Three players per side.\nFull-team chaos." };
+                float cw = fminf(380.0f, (sw - 128 - 48) / 3.0f), ch = 270, cy = 150, x0 = 64;
+                float ry = cy + ch + 34;
+                int p;
+                ui_begin(SCR_ONLINE, nav, g_set.playlist - 1);
+                DrawRectangle(0, 0, sw, sh, (Color){ 0, 0, 0, 110 });
+                ui_chrome("QUICK MATCH", "Online  -  pick a playlist", hints);
+                for (p = 1; p <= 3; p++) {
+                    if (ui_card((Rectangle){ x0 + (p - 1) * (cw + 24), cy, cw, ch }, plTitle[p], plTag[p], plDesc[p], g_set.playlist == p, p)) {
+                        if (g_set.playlist == p) uiAct = UA_FIND_MATCH;   /* confirm an already selected playlist */
+                        g_set.playlist = p;
+                    }
+                }
+                ui_textfield((Rectangle){ x0, ry, 380, 64 }, "SERVER  (host or host:port)", g_set.server, (int)sizeof(g_set.server), 1);
+                ui_textfield((Rectangle){ x0 + 400, ry, 300, 64 }, "PLAYER NAME", g_set.name, 20, 0);
+                if (ui_button((Rectangle){ x0 + 720, ry, fmaxf(260.0f, 3 * cw + 48 - 720), 64 }, "FIND MATCH",
+                              TextFormat("%s  -  %s", plTag[g_set.playlist], CAR_NAMES[g_set.car]), 1))
+                    uiAct = UA_FIND_MATCH;
+                if (onlineMsg[0]) ui_text(onlineMsg, (int)x0, (int)ry + 82, 20, (Color){ 255, 205, 110, 255 });
+                DrawText("If nobody else is searching, bots fill the empty seats after a few minutes. "
+                         "Players who leave a match are replaced by bots.", (int)x0, (int)ry + 114, 15, UI_TEXT_DIM);
+                if (ui_button((Rectangle){ 64, (float)sh - 150, 220, 52 }, "BACK", NULL, 0) || nav.back) uiAct = UA_GO_PLAY;
+                ui_profile(g_set.name, CAR_NAMES[g_set.car], paintName);
+                ui_end();
+            } else if (screen == SCR_SEARCHING) {
+                Rectangle pr = { sw * 0.5f - 320, sh * 0.5f - 210, 640, 420 };
+                int queued = netClient.state == NET_QUEUED;
+                int secs = (int)netClient.queueSearchSec, need = netClient.queueNeeded > 0 ? netClient.queueNeeded : 2 * g_set.playlist;
+                int have = netClient.queueInQueue > 0 ? netClient.queueInQueue : 1, k;
+                ui_begin(SCR_SEARCHING, nav, 0);
+                DrawRectangle(0, 0, sw, sh, (Color){ 0, 0, 0, 120 });
+                ui_chrome("QUICK MATCH", PLAYLIST_LABELS[g_set.playlist], NULL);
+                ui_panel(pr, 0.06f, UI_PANEL, UI_PANEL_LINE);
+                DrawRectangleRounded((Rectangle){ pr.x + 2, pr.y + 2, pr.width - 4, 8 }, 1.0f, 4, UI_ACCENT);
+                ui_spinner_anim((Vector2){ pr.x + 70, pr.y + 78 }, 30, g_ui.t);
+                ui_text(queued ? "SEARCHING FOR MATCH" : "CONNECTING TO SERVER", (int)pr.x + 122, (int)pr.y + 44, 30, UI_TEXT);
+                DrawText(queued ? PLAYLIST_LABELS[g_set.playlist] : g_set.server, (int)pr.x + 124, (int)pr.y + 82, 18, UI_ACCENT);
+                ui_text_c(TextFormat("%d:%02d", secs / 60, secs % 60), pr.x + pr.width * 0.5f, (int)pr.y + 126, 64, UI_TEXT);
+                /* seats: filled = players searching this playlist */
+                for (k = 0; k < need; k++) {
+                    float sx = pr.x + pr.width * 0.5f + (k - (need - 1) * 0.5f) * 46.0f, sy = pr.y + 226;
+                    int filled = queued && k < have;
+                    Color c = k < need / 2 ? UI_BLUE : UI_ORANGE;
+                    DrawCircle((int)sx, (int)sy, 16, filled ? c : (Color){ 30, 38, 55, 255 });
+                    DrawCircleLines((int)sx, (int)sy, 16, ColorAlpha(c, 0.8f));
+                }
+                ui_text_c(queued ? TextFormat("%d of %d players searching", have, need) : netClient.statusMsg,
+                          pr.x + pr.width * 0.5f, (int)pr.y + 252, 18, UI_TEXT_DIM);
+                if (queued && netClient.queueBotFillSec >= 0.0f) {
+                    float left = netClient.queueBotFillSec, frac = netClient.queueSearchSec / fmaxf(1.0f, netClient.queueSearchSec + left);
+                    Rectangle bar = { pr.x + 60, pr.y + 290, pr.width - 120, 10 };
+                    DrawRectangleRounded(bar, 1.0f, 4, (Color){ 30, 38, 55, 255 });
+                    DrawRectangleRounded((Rectangle){ bar.x, bar.y, bar.width * fminf(1.0f, frac), bar.height }, 1.0f, 4, UI_ACCENT);
+                    ui_text_c(left > 0.5f ? TextFormat("Bots fill empty seats in %d:%02d", (int)left / 60, (int)left % 60)
+                                          : "Starting with bots...", pr.x + pr.width * 0.5f, (int)pr.y + 306, 16, UI_TEXT_DIM);
+                }
+                if (queued)
+                    DrawText(TextFormat("%d online  -  %d match%s in progress  -  ping %.0f ms", netClient.queuePlayersOnline,
+                                        netClient.queueMatches, netClient.queueMatches == 1 ? "" : "es", netClient.pingMs),
+                             (int)pr.x + 24, (int)(pr.y + pr.height - 30), 14, UI_TEXT_DIM);
+                if (ui_button((Rectangle){ pr.x + pr.width - 204, pr.y + pr.height - 80, 180, 52 }, "CANCEL", NULL, 0) || nav.back)
+                    uiAct = UA_CANCEL_SEARCH;
+                ui_end();
+            } else if (screen == SCR_OFFLINE) {
+                static const char *modeDesc[] = { "Free play: just you and the ball. Practise shots, aerials and recoveries.",
+                                                  "1v1 against a bot.", "2v2: you and a bot teammate against two bots.",
+                                                  "3v3: you and two bot teammates against three bots." };
+                float x = 64, y = 170, w = 520, h = 58, gap = 12;
+                int d;
+                ui_begin(SCR_OFFLINE, nav, 3);
+                DrawRectangleGradientH(0, 0, (int)(sw * 0.55f), sh, (Color){ 4, 6, 12, 210 }, (Color){ 4, 6, 12, 0 });
+                ui_chrome("EXHIBITION", "Offline", hints);
+                if ((d = ui_spinner((Rectangle){ x, y, w, h }, "MODE", MODE_NAMES[g_set.mode]))) { g_set.mode = (g_set.mode + d + 4) % 4; settings_save(); }
+                if ((d = ui_spinner((Rectangle){ x, y + (h + gap), w, h }, "BOT DIFFICULTY", SKILL_NAMES[g_set.botSkill]))) { g_set.botSkill = (g_set.botSkill + d + 3) % 3; settings_save(); }
+                if ((d = ui_spinner((Rectangle){ x, y + 2 * (h + gap), w, h }, "MATCH LENGTH", MATCH_NAMES[g_set.matchIdx]))) { g_set.matchIdx = (g_set.matchIdx + d + 4) % 4; settings_save(); }
+                DrawText(modeDesc[g_set.mode], (int)x, (int)(y + 3 * (h + gap) + 4), 16, UI_TEXT_DIM);
+                if (ui_button((Rectangle){ x, y + 3 * (h + gap) + 34, w, 70 }, "START MATCH", MODE_NAMES[g_set.mode], 1)) uiAct = UA_START_OFFLINE;
+                if (ui_button((Rectangle){ 64, (float)sh - 150, 220, 52 }, "BACK", NULL, 0) || nav.back) uiAct = UA_GO_PLAY;
+                ui_profile(g_set.name, CAR_NAMES[g_set.car], paintName);
+                ui_end();
+            } else if (screen == SCR_GARAGE) {
+                float x = 64, y = 170, w = 520, h = 58, gap = 12;
+                int d;
+                ui_begin(SCR_GARAGE, nav, 0);
+                DrawRectangleGradientH(0, 0, (int)(sw * 0.55f), sh, (Color){ 4, 6, 12, 210 }, (Color){ 4, 6, 12, 0 });
+                ui_chrome("GARAGE", "Car and paint", hints);
+                if ((d = ui_spinner((Rectangle){ x, y, w, h }, "CAR", CAR_NAMES[g_set.car]))) carAdj = d;
+                if ((d = ui_spinner((Rectangle){ x, y + (h + gap), w, h }, "PAINT", paintName))) { g_set.skin = (g_set.skin + d + 2) % 2; settings_save(); }
+                DrawText("Your car and paint are used offline and in online matches.", (int)x, (int)(y + 2 * (h + gap) + 4), 16, UI_TEXT_DIM);
+                if (ui_button((Rectangle){ 64, (float)sh - 150, 220, 52 }, "BACK", NULL, 0) || nav.back) uiAct = UA_GO_MENU;
+                {
+                    const char *cn = TextFormat("%s", CAR_NAMES[g_set.car]);
+                    char up[32]; int c;
+                    for (c = 0; cn[c] && c < 31; c++) up[c] = (char)(cn[c] >= 'a' && cn[c] <= 'z' ? cn[c] - 32 : cn[c]);
+                    up[c] = 0;
+                    ui_text(up, sw - 64 - MeasureText(up, 64), sh - 200, 64, UI_TEXT);
+                    DrawText(paintName, sw - 64 - MeasureText(paintName, 20), sh - 130, 20, UI_ACCENT);
+                }
+                ui_end();
+            } else if (screen == SCR_PAUSE) {
+                Rectangle pr = { sw * 0.5f - 250, sh * 0.5f - 230, 500, 460 };
+                float bx = pr.x + 30, bw = pr.width - 60, by = pr.y + 110, bh = 54, gap = 12;
+                ui_begin(SCR_PAUSE, nav, 0);
+                DrawRectangle(0, 0, sw, sh, (Color){ 0, 0, 0, 140 });
+                ui_panel(pr, 0.06f, UI_PANEL, UI_PANEL_LINE);
+                DrawRectangleRounded((Rectangle){ pr.x + 2, pr.y + 2, pr.width - 4, 8 }, 1.0f, 4, UI_ACCENT);
+                ui_text_c("PAUSED", pr.x + pr.width * 0.5f, (int)pr.y + 30, 40, UI_TEXT);
+                DrawText(isOnline ? "The match keeps going while you're paused" : MODE_NAMES[g_set.mode],
+                         (int)(pr.x + pr.width * 0.5f - MeasureText(isOnline ? "The match keeps going while you're paused" : MODE_NAMES[g_set.mode], 15) * 0.5f),
+                         (int)pr.y + 76, 15, UI_TEXT_DIM);
+                if (ui_button((Rectangle){ bx, by, bw, bh }, "RESUME", NULL, 1) || nav.back) uiAct = UA_RESUME;
+                if (ui_button((Rectangle){ bx, by + (bh + gap), bw, bh }, "SETTINGS", NULL, 0)) uiAct = UA_PAUSE_SETTINGS;
+                if (isOnline) {
+                    if (ui_button((Rectangle){ bx, by + 2 * (bh + gap), bw, bh }, "LEAVE MATCH", "A bot will take your place", 0)) uiAct = UA_LEAVE_MATCH;
+                } else {
+                    if (ui_button((Rectangle){ bx, by + 2 * (bh + gap), bw, bh }, "RESTART MATCH", NULL, 0)) uiAct = UA_RESTART;
+                }
+                if (ui_button((Rectangle){ bx, by + 3 * (bh + gap), bw, bh }, "MAIN MENU", NULL, 0)) uiAct = UA_POST_MENU;
+                if (ui_button((Rectangle){ bx, by + 4 * (bh + gap), bw, bh }, "EXIT GAME", NULL, 0)) uiAct = UA_QUIT;
+                ui_end();
+            } else if (screen == SCR_SETTINGS) {
+                MenuItem it[13];
+                memset(it, 0, sizeof(it));
+                it[0].label = "CAMERA DISTANCE";  snprintf(it[0].value, 48, "%.1f m", g_set.camDist);
+                it[1].label = "CAMERA HEIGHT";    snprintf(it[1].value, 48, "%.2f", g_set.camHeight);
+                it[2].label = "FIELD OF VIEW";    snprintf(it[2].value, 48, "%.0f", g_set.fov);
+                it[3].label = "BOOST FOV KICK";   snprintf(it[3].value, 48, "%s", g_set.boostFov ? "On" : "Off");
+                it[4].label = "MATCH LENGTH";     snprintf(it[4].value, 48, "%s", MATCH_NAMES[g_set.matchIdx]);
+                it[5].label = "INVERT AIR PITCH"; snprintf(it[5].value, 48, "%s", g_set.invertPitch ? "On" : "Off");
+                it[6].label = "FULLSCREEN";       snprintf(it[6].value, 48, "%s", g_set.fullscreen ? "On" : "Off");
+                it[7].label = "SHOW FPS";         snprintf(it[7].value, 48, "%s", g_set.showFps ? "On" : "Off");
+                it[8].label = "SHOW CONTROLS";    snprintf(it[8].value, 48, "%s", g_set.showHints ? "On" : "Off");
+                it[9].label = "SHADOWS";          snprintf(it[9].value, 48, "%s", g_set.shadows ? "On" : "Off");
+                it[10].label = "BLOOM";           snprintf(it[10].value, 48, "%s", g_set.bloom ? "On" : "Off");
+                it[11].label = "USE ORIGINAL CAMERA"; snprintf(it[11].value, 48, "5.4 m / 59");
+                it[12].label = "BACK";
+                menu_run("SETTINGS", it, 13, &setSel, nav, &act, &adj);
+                if (setSel == 4)
+                    DrawText("match length applies to offline matches", sw / 2 - MeasureText("match length applies to offline matches", 18) / 2,
+                             sh - 70, 18, (Color){ 255, 190, 120, 255 });
+            } else if (screen == SCR_GAME && state == ST_OVER) {
+                /* --- post-match: result, rosters, next step --------------------------- */
+                int me = isOnline ? netClient.localSlot : 0, myTeam = team[me];
+                int won = myTeam == 0 ? scoreBlue > scoreOrange : scoreOrange > scoreBlue, draw = scoreBlue == scoreOrange;
+                Rectangle pr = { sw * 0.5f - 360, sh * 0.5f - 250, 720, 500 };
+                const char *res = draw ? "DRAW" : won ? "VICTORY" : "DEFEAT";
+                Color rc = draw ? UI_TEXT : won ? (Color){ 255, 205, 80, 255 } : (Color){ 230, 90, 80, 255 };
+                int t, row;
+                ui_begin(200, nav, 0);
+                DrawRectangle(0, 0, sw, sh, (Color){ 0, 0, 0, 110 });
+                ui_panel(pr, 0.05f, UI_PANEL, UI_PANEL_LINE);
+                DrawRectangleRounded((Rectangle){ pr.x + 2, pr.y + 2, pr.width - 4, 8 }, 1.0f, 4, rc);
+                ui_text_c(res, pr.x + pr.width * 0.5f, (int)pr.y + 26, 60, rc);
+                ui_text(TextFormat("%d", scoreBlue), (int)(pr.x + pr.width * 0.5f - 70 - MeasureText(TextFormat("%d", scoreBlue), 48)), (int)pr.y + 96, 48, UI_BLUE);
+                ui_text_c("-", pr.x + pr.width * 0.5f, (int)pr.y + 96, 48, UI_TEXT_DIM);
+                ui_text(TextFormat("%d", scoreOrange), (int)(pr.x + pr.width * 0.5f + 70), (int)pr.y + 96, 48, UI_ORANGE);
+                for (t = 0; t < 2; t++) {
+                    float cx = pr.x + 30 + t * (pr.width * 0.5f - 15);
+                    float cw = pr.width * 0.5f - 45;
+                    DrawRectangleRounded((Rectangle){ cx, pr.y + 166, cw, 34 }, 0.3f, 4, t == 0 ? (Color){ 24, 72, 165, 240 } : (Color){ 195, 75, 18, 240 });
+                    DrawText(t == 0 ? "BLUE" : "ORANGE", (int)cx + 14, (int)pr.y + 174, 18, RAYWHITE);
+                    row = 0;
+                    for (i = 0; i < (isOnline ? SARP_MAX_CLIENTS : nCars); i++) {
+                        const char *nm;
+                        int isMe = i == me, bot;
+                        if (isOnline ? (!netClient.players[i].active || netClient.players[i].team != t) : team[i] != t) continue;
+                        bot = isOnline ? netClient.players[i].isBot : i != 0;
+                        nm = isOnline ? netClient.players[i].name : (i == 0 ? g_set.name : TextFormat("Bot %d", i));
+                        DrawRectangleRounded((Rectangle){ cx, pr.y + 208 + row * 38, cw, 32 }, 0.3f, 4,
+                                             isMe ? (Color){ 40, 60, 90, 240 } : (Color){ 18, 24, 36, 200 });
+                        DrawText(nm, (int)cx + 14, (int)(pr.y + 215 + row * 38), 18, isMe ? UI_ACCENT_HI : UI_TEXT);
+                        if (bot) DrawText("BOT", (int)(cx + cw - 50), (int)(pr.y + 217 + row * 38), 14, UI_TEXT_DIM);
+                        else if (isMe) DrawText("YOU", (int)(cx + cw - 50), (int)(pr.y + 217 + row * 38), 14, UI_ACCENT);
+                        row++;
+                    }
+                }
+                if (isOnline) {
+                    if (ui_button((Rectangle){ pr.x + 30, pr.y + pr.height - 86, 320, 60 }, "QUEUE AGAIN", PLAYLIST_LABELS[netClient.playlist % 4], 1)) uiAct = UA_REQUEUE;
+                    if (ui_button((Rectangle){ pr.x + pr.width - 350, pr.y + pr.height - 86, 320, 60 }, "MAIN MENU", NULL, 0)) uiAct = UA_POST_MENU;
+                    DrawText(TextFormat("Returning to the menu in %d", (int)ceilf(fmaxf(0.0f, stateTimer))),
+                             (int)(pr.x + pr.width * 0.5f - MeasureText(TextFormat("Returning to the menu in %d", (int)ceilf(fmaxf(0.0f, stateTimer))), 14) * 0.5f),
+                             (int)(pr.y + pr.height - 112), 14, UI_TEXT_DIM);
+                } else {
+                    if (ui_button((Rectangle){ pr.x + 30, pr.y + pr.height - 86, 320, 60 }, "REMATCH", MODE_NAMES[g_set.mode], 1)) uiAct = UA_RESTART;
+                    if (ui_button((Rectangle){ pr.x + pr.width - 350, pr.y + pr.height - 86, 320, 60 }, "MAIN MENU", NULL, 0)) uiAct = UA_POST_MENU;
+                }
+                ui_end();
+            }
         }
         EndDrawing();
 
         /* --- apply menu actions ------------------------------------------ */
-        if (screen == SCR_MENU) {
-            if (act == 0) { isOnline = 0; NEW_MATCH(); cam.position = Vector3Add(cars[0].pos, V3(-g_set.camDist, 2.0f, 0)); screen = SCR_GAME; }
-            if (act == 1) { screen = SCR_ONLINE_JOIN; onlineSel = 4; }
-            if (menuSel == 2 && adj) {
-                int prev = g_set.car;
-                g_set.car = (g_set.car + adj + CAR_COUNT) % CAR_COUNT;
-                if (!load_car(CAR_NAMES[g_set.car], &cars[0], &crs[0], lit, 1)) { g_set.car = prev; load_car(CAR_NAMES[prev], &cars[0], &crs[0], lit, 1); }
-                carModel[0] = g_set.car;
-                settings_save();
-            }
-            if (menuSel == 3 && adj) { g_set.skin = (g_set.skin + adj + 2) % 2; settings_save(); }
-            if (menuSel == 4 && adj) { g_set.mode = (g_set.mode + adj + 4) % 4; settings_save(); }
-            if (menuSel == 5 && adj) { g_set.botSkill = (g_set.botSkill + adj + 3) % 3; settings_save(); }
-            if (act == 6) { settingsFrom = SCR_MENU; setSel = 0; screen = SCR_SETTINGS; }
-            if (act == 7) quit = 1;
-        } else if (screen == SCR_ONLINE_JOIN) {
-            int key = GetCharPressed();
-            while (key > 0) {
-                if (onlineSel == 0) {
-                    int len = (int)strlen(customIpInput);
-                    if (len < 28 && ((key >= '0' && key <= '9') || key == '.' || key == ':' || (key >= 'a' && key <= 'z'))) {
-                        customIpInput[len] = (char)key; customIpInput[len + 1] = 0;
-                    }
-                } else if (onlineSel == 2) {
-                    int len = (int)strlen(playerNameInput);
-                    if (len < 16 && (key >= 32 && key <= 126)) {
-                        playerNameInput[len] = (char)key; playerNameInput[len + 1] = 0;
-                    }
-                }
-                key = GetCharPressed();
-            }
-            if (IsKeyPressed(KEY_BACKSPACE)) {
-                if (onlineSel == 0 && strlen(customIpInput) > 0) customIpInput[strlen(customIpInput) - 1] = 0;
-                if (onlineSel == 2 && strlen(playerNameInput) > 0) playerNameInput[strlen(playerNameInput) - 1] = 0;
-            }
-
-            if (onlineSel == 0 && adj) {
-                static const char *presets[] = { "127.0.0.1", "192.168.1.100", "10.0.0.1", "localhost" };
-                static int preIdx = 0;
-                preIdx = (preIdx + adj + 4) % 4;
-                strncpy(customIpInput, presets[preIdx], sizeof(customIpInput) - 1);
-            }
-            if (onlineSel == 3 && adj) {
-                prefTeamSel = (prefTeamSel + adj + 3) % 3;
-            }
-
-            if (act == 4 || (onlineSel == 4 && nav.ok)) {
-                net_client_connect(&netClient, customIpInput, netClient.serverPort, playerNameInput, g_set.car, g_set.skin, prefTeamSel);
-            }
-            if (act == 5 || nav.back) {
-                net_client_disconnect(&netClient);
-                screen = SCR_MENU;
-            }
-
-            net_client_poll(&netClient, dt);
-            if (netClient.state == NET_CONNECTED) {
-                isOnline = 1;
-                online_reset();
-                int mySlot = netClient.localSlot;
-                carModel[mySlot] = g_set.car;
-                team[mySlot] = netClient.localTeam;
-                load_car(CAR_NAMES[g_set.car], &cars[mySlot], &crs[mySlot], lit, 1);
-
-                Vector3 kp; float ky;
-                kickoff_spot(mySlot / 2, team[mySlot], 4, &kp, &ky);
-                car_reset(&cars[mySlot], kp, ky);
-                cars[mySlot].boost = BOOST_START;
-                cars[mySlot].demolished = 0;
-                cars[mySlot].demoTimer = 0.0f;
-
-                for (i = 0; i < SARP_MAX_CLIENTS; i++) {
-                    if (i != mySlot) {
-                        cars[i].pos = V3(0, -500, 0);
-                        cars[i].vel = V3(0, 0, 0);
-                        cars[i].rot = (Quaternion){ 0, 0, 0, 1 };
-                        carModel[i] = -1;
-                    }
-                    prevPos[i] = cars[i].pos;
-                    prevRot[i] = cars[i].rot;
-                    rcars[i] = cars[i];
-                }
-                ball_reset(&ball);
-                prevBallPos = ball.pos;
-                prevBallRot = ball.rot;
-                rball = ball;
-                state = ST_PLAY;
-                stateTimer = 0.0f;
-                acc = 0.0f;
-                pendingJump = 0;
-                camSnap = 1;
-                screen = SCR_GAME;
-            }
-        } else if (screen == SCR_PAUSE) {
-            if (act == 0 || nav.back) screen = SCR_GAME;
-            if (act == 1) {
-                if (isOnline) {
-                    net_client_disconnect(&netClient);
-                    isOnline = 0;
-                    screen = SCR_MENU;
-                } else {
-                    NEW_MATCH();
-                    screen = SCR_GAME;
-                }
-            }
-            if (act == 2) { settingsFrom = SCR_PAUSE; setSel = 0; screen = SCR_SETTINGS; }
-            if (act == 3) {
-                if (isOnline) {
-                    net_client_disconnect(&netClient);
-                    isOnline = 0;
-                }
-                menuSel = 0;
-                screen = SCR_MENU;
-            }
-            if (act == 4) quit = 1;
-        } else if (screen == SCR_SETTINGS) {
+        switch (uiAct) {
+        case UA_GO_MENU:     screen = SCR_MENU; break;
+        case UA_GO_PLAY:     screen = SCR_PLAY; break;
+        case UA_GO_ONLINE:   screen = SCR_ONLINE; onlineMsg[0] = 0; break;
+        case UA_GO_OFFLINE:  screen = SCR_OFFLINE; break;
+        case UA_GO_GARAGE:   screen = SCR_GARAGE; break;
+        case UA_GO_SETTINGS: settingsFrom = SCR_MENU; setSel = 0; screen = SCR_SETTINGS; break;
+        case UA_QUIT:        quit = 1; break;
+        case UA_FIND_MATCH:  START_SEARCH(); break;
+        case UA_CANCEL_SEARCH:
+            net_client_disconnect(&netClient);
+            onlineMsg[0] = 0;
+            screen = SCR_ONLINE;
+            break;
+        case UA_START_OFFLINE:
+            isOnline = 0;
+            NEW_MATCH();
+            cam.position = Vector3Add(cars[0].pos, V3(-g_set.camDist, 2.0f, 0));
+            screen = SCR_GAME;
+            break;
+        case UA_RESUME:          screen = SCR_GAME; break;
+        case UA_PAUSE_SETTINGS:  settingsFrom = SCR_PAUSE; setSel = 0; screen = SCR_SETTINGS; break;
+        case UA_RESTART:         NEW_MATCH(); screen = SCR_GAME; break;
+        case UA_LEAVE_MATCH:
+            net_client_disconnect(&netClient);
+            LEAVE_ONLINE();
+            snprintf(onlineMsg, sizeof(onlineMsg), "You left the match. A bot took your place.");
+            screen = SCR_ONLINE;
+            break;
+        case UA_REQUEUE:
+            net_client_disconnect(&netClient);
+            LEAVE_ONLINE();
+            START_SEARCH();
+            break;
+        case UA_POST_MENU:
+            if (isOnline) { net_client_disconnect(&netClient); LEAVE_ONLINE(); }
+            screen = SCR_MENU;
+            break;
+        default: break;
+        }
+        if (carAdj) {
+            int prev = g_set.car;
+            g_set.car = (g_set.car + carAdj + CAR_COUNT) % CAR_COUNT;
+            if (!load_car(CAR_NAMES[g_set.car], &cars[0], &crs[0], lit, 1)) { g_set.car = prev; load_car(CAR_NAMES[prev], &cars[0], &crs[0], lit, 1); }
+            carModel[0] = g_set.car;
+            settings_save();
+            carAdj = 0;
+        }
+        if (screen == SCR_SETTINGS) {
             if (adj) {
                 switch (setSel) {
                 case 0: g_set.camDist   = clampf(g_set.camDist + 0.5f * adj, 3.0f, 14.0f); break;

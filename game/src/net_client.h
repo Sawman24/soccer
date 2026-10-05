@@ -7,8 +7,9 @@
 
 typedef enum NetClientState {
     NET_DISCONNECTED = 0,
-    NET_CONNECTING,
-    NET_CONNECTED
+    NET_CONNECTING,   /* waiting for the server to answer           */
+    NET_QUEUED,       /* searching for a match (quick-match queue)  */
+    NET_CONNECTED     /* in a match                                 */
 } NetClientState;
 
 typedef struct NetClientPlayer {
@@ -22,6 +23,7 @@ typedef struct NetClientPlayer {
     float    boost;
     int      wheelsOnGround;
     int      supersonic;
+    int      isBot;
     int      boosting;
     float    steerAngle;
     float    wheelSpin;
@@ -38,6 +40,7 @@ typedef struct NetClient {
     uint8_t          serverAddr[16];  /* resolved sockaddr_in (resolved once at connect) */
     char             playerName[24];
     int              preferredTeam;   /* 0 = Blue, 1 = Orange, 2 = Auto */
+    int              playlist;        /* players per team: 1, 2, 3 */
     int              localSlot;       /* 0..7 assigned by server */
     int              localTeam;       /* 0 = Blue, 1 = Orange */
     int              carModel;
@@ -60,12 +63,20 @@ typedef struct NetClient {
     NetVec3          ballTargetVel;
     NetQuat          ballTargetRot;
 
+    /* Quick-match queue (NET_QUEUED) */
+    int              queueInQueue, queueNeeded, queuePlayersOnline, queueMatches;
+    float            queueSearchSec;  /* extrapolated locally between updates */
+    float            queueBotFillSec; /* < 0 = bot fill disabled */
+    int              disconnectReason;/* DISC_* of the last server disconnect, -1 = none */
+
     /* Authoritative match state */
     uint8_t          serverGameState; /* 0 = COUNTDOWN, 1 = PLAY, 2 = GOAL, 3 = OVER */
     float            serverStateTimer;
     float            serverMatchTime;
     uint8_t          scoreBlue;
     uint8_t          scoreOrange;
+    uint8_t          serverPlaylist;
+    uint8_t          overtime;
     uint32_t         serverTick;
 
     /* Latest raw snapshot, consumed by the game's rollback/reconcile step */
@@ -98,7 +109,8 @@ typedef struct NetClient {
 } NetClient;
 
 void net_client_init(NetClient *cli);
-int  net_client_connect(NetClient *cli, const char *ip, int port, const char *name, int car_model, int skin, int pref_team);
+/* Connect and start searching the given playlist (players per team). */
+int  net_client_connect(NetClient *cli, const char *ip, int port, const char *name, int car_model, int skin, int playlist);
 void net_client_disconnect(NetClient *cli);
 void net_client_send_tick(NetClient *cli, const NetInput *curInput);
 void net_client_poll(NetClient *cli, float dt);

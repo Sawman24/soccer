@@ -64,6 +64,7 @@ static void cli_send_join(NetClient *cli)
     req.car_model = (uint8_t)cli->carModel;
     req.skin = (uint8_t)cli->skin;
     req.pref_team = (uint8_t)cli->preferredTeam;
+    req.playlist = (uint8_t)cli->playlist;
     cli_send(cli, &req, sizeof(req));
 }
 
@@ -77,12 +78,14 @@ void net_client_init(NetClient *cli)
     snprintf(cli->serverIp, sizeof(cli->serverIp), "127.0.0.1");
     snprintf(cli->playerName, sizeof(cli->playerName), "Striker");
     cli->preferredTeam = 2; /* Auto */
+    cli->playlist = 2;
+    cli->disconnectReason = -1;
     cli->localSlot = 0;
     cli->statusOk = 0; /* Normal/gray */
     snprintf(cli->statusMsg, sizeof(cli->statusMsg), "Ready to connect.");
 }
 
-int net_client_connect(NetClient *cli, const char *ip, int port, const char *name, int car_model, int skin, int pref_team)
+int net_client_connect(NetClient *cli, const char *ip, int port, const char *name, int car_model, int skin, int playlist)
 {
     NetAddr resolved;
     if (!cli) return 0;
@@ -98,7 +101,12 @@ int net_client_connect(NetClient *cli, const char *ip, int port, const char *nam
     if (name && name[0]) snprintf(cli->playerName, sizeof(cli->playerName), "%s", name);
     cli->carModel = car_model;
     cli->skin = skin;
-    cli->preferredTeam = pref_team;
+    cli->preferredTeam = 2;
+    cli->playlist = (playlist >= 1 && playlist <= 3) ? playlist : 2;
+    cli->disconnectReason = -1;
+    cli->queueInQueue = 0; cli->queueNeeded = 2 * cli->playlist;
+    cli->queueSearchSec = 0.0f; cli->queueBotFillSec = -1.0f;
+    cli->overtime = 0;
 
     /* Resolve once (supports host names); previously inet_addr() ran on every packet */
     if (!net_addr_resolve(cli->serverIp, cli->serverPort, &resolved)) {
@@ -148,7 +156,7 @@ void net_client_disconnect(NetClient *cli)
 {
     if (!cli) return;
     NetSocket s = (NetSocket)cli->sock;
-    if (s != NET_INVALID_SOCKET && cli->state == NET_CONNECTED) {
+    if (s != NET_INVALID_SOCKET && (cli->state == NET_CONNECTED || cli->state == NET_QUEUED)) {
         PktDisconnect pkt;
         memset(&pkt, 0, sizeof(pkt));
         cli_header(cli, &pkt.header, PKT_DISCONNECT, (uint8_t)cli->localSlot);
@@ -220,6 +228,8 @@ static void cli_handle_snapshot(NetClient *cli, const PktServerState *st)
     cli->serverMatchTime = st->match_time;
     cli->scoreBlue = st->score_blue;
     cli->scoreOrange = st->score_orange;
+    cli->serverPlaylist = st->playlist;
+    cli->overtime = st->overtime;
     cli->snapBall = st->ball;
     memcpy(cli->snapCars, st->cars, sizeof(cli->snapCars));
 
@@ -241,6 +251,7 @@ static void cli_handle_snapshot(NetClient *cli, const PktServerState *st)
         snprintf(p->name, sizeof(p->name), "%.19s", ncs->player_name[0] ? ncs->player_name : "Player");
         p->wheelsOnGround = ncs->wheels_on_ground;
         p->supersonic = ncs->supersonic;
+        p->isBot = (ncs->flags & NCF_BOT) != 0;
         p->boost = ncs->boost;
         p->boosting = (ncs->flags & NCF_BOOSTING) != 0;
         p->steerAngle = ncs->steerAngle;
@@ -281,6 +292,21 @@ void net_client_poll(NetClient *cli, float dt)
         }
     }
 
+    /* Searching: keep the session alive (and measure ping) */
+    if (cli->state == NET_QUEUED) {
+        double now = net_get_time_sec();
+        cli->queueSearchSec += dt;
+        if (cli->queueBotFillSec > 0.0f) cli->queueBotFillSec = cli->queueBotFillSec - dt > 0.0f ? cli->queueBotFillSec - dt : 0.0f;
+        if (now - cli->pingTimer > 1.0) {
+            PktPing ping;
+            cli->pingTimer = now;
+            memset(&ping, 0, sizeof(ping));
+            cli_header(cli, &ping.header, PKT_PING, 0xFF);
+            ping.client_time_ms = (uint32_t)(now * 1000.0);
+            cli_send(cli, &ping, sizeof(ping));
+        }
+    }
+
     /* Process all pending incoming UDP packets */
     uint8_t buf[2048];
     NetAddr sender;
@@ -307,22 +333,37 @@ void net_client_poll(NetClient *cli, float dt)
 
         if (hdr->type == PKT_JOIN_ACK && (size_t)n >= sizeof(PktJoinAck)) {
             PktJoinAck *ack = (PktJoinAck *)buf;
-            if (cli->state != NET_CONNECTING) continue;   /* duplicate ack from a resent join */
-            if (ack->accepted) {
+            if (cli->state != NET_CONNECTING && cli->state != NET_QUEUED) continue;   /* duplicate ack */
+            if (ack->accepted && ack->assigned_id < SARP_MAX_CLIENTS) {
                 cli->state = NET_CONNECTED;
                 cli->localSlot = ack->assigned_id;
                 cli->localTeam = ack->assigned_team;
                 cli->serverSeqAck = hdr->seq;
                 cli->statusOk = 2; /* Green */
                 snprintf(cli->statusMsg, sizeof(cli->statusMsg),
-                         "Connected! Joined as %s Team (Slot %d)",
-                         cli->localTeam == 0 ? "BLUE" : "ORANGE", cli->localSlot);
+                         "Match found! Playing for %s", cli->localTeam == 0 ? "BLUE" : "ORANGE");
+            } else if (ack->accepted) {
+                continue;
             } else {
                 cli->state = NET_DISCONNECTED;
                 cli->statusOk = 3; /* Red */
                 snprintf(cli->statusMsg, sizeof(cli->statusMsg), "Connection rejected: %.31s",
                          ack->server_name[0] ? ack->server_name : "server full");
             }
+        } else if (hdr->type == PKT_QUEUE_STATUS && (size_t)n >= sizeof(PktQueueStatus)) {
+            const PktQueueStatus *q = (const PktQueueStatus *)buf;
+            if (cli->state != NET_CONNECTING && cli->state != NET_QUEUED) continue;
+            if (cli->state == NET_CONNECTING) {
+                cli->state = NET_QUEUED;
+                cli->statusOk = 1;
+            }
+            cli->queueInQueue = q->in_queue;
+            cli->queueNeeded = q->needed;
+            cli->queuePlayersOnline = q->players_online;
+            cli->queueMatches = q->matches_active;
+            cli->queueSearchSec = q->search_sec;
+            cli->queueBotFillSec = q->bot_fill_sec;
+            snprintf(cli->statusMsg, sizeof(cli->statusMsg), "Searching... %d/%d players", q->in_queue, q->needed);
         } else if (hdr->type == PKT_PONG && (size_t)n >= sizeof(PktPong)) {
             PktPong *pong = (PktPong *)buf;
             uint32_t now_ms = (uint32_t)(net_get_time_sec() * 1000.0);
@@ -330,7 +371,16 @@ void net_client_poll(NetClient *cli, float dt)
             if (sample >= 0.0f && sample < 5000.0f)
                 cli->pingMs = cli->pingMs <= 0.0f ? sample : cli->pingMs * 0.75f + sample * 0.25f;
         } else if (hdr->type == PKT_SERVER_STATE && (size_t)n >= sizeof(PktServerState)) {
-            if (cli->state == NET_CONNECTED) cli_handle_snapshot(cli, (const PktServerState *)buf);
+            const PktServerState *st = (const PktServerState *)buf;
+            if ((cli->state == NET_QUEUED || cli->state == NET_CONNECTING) && st->your_slot < SARP_MAX_CLIENTS) {
+                /* match started (our JOIN_ACK may have been lost): snapshots name our car */
+                cli->state = NET_CONNECTED;
+                cli->localSlot = st->your_slot;
+                cli->localTeam = st->cars[st->your_slot].team;
+                cli->statusOk = 2;
+                snprintf(cli->statusMsg, sizeof(cli->statusMsg), "Match found!");
+            }
+            if (cli->state == NET_CONNECTED) cli_handle_snapshot(cli, st);
         } else if (hdr->type == PKT_EVENT_GOAL && (size_t)n >= sizeof(PktEventGoal)) {
             PktEventGoal *eg = (PktEventGoal *)buf;
             cli->hasGoalEvent = 1;
@@ -348,14 +398,17 @@ void net_client_poll(NetClient *cli, float dt)
             snprintf(cli->demoVictim, sizeof(cli->demoVictim), "%s", vName);
             cli->demoBannerTimer = 3.0f;
         } else if (hdr->type == PKT_DISCONNECT) {
+            const PktDisconnect *d = (const PktDisconnect *)buf;
+            cli->disconnectReason = (size_t)n >= sizeof(PktDisconnect) ? d->reason : DISC_KICKED;
             cli->state = NET_DISCONNECTED;
-            cli->statusOk = 3; /* Red */
-            snprintf(cli->statusMsg, sizeof(cli->statusMsg), "Server closed or match ended.");
+            cli->statusOk = cli->disconnectReason == DISC_MATCH_OVER ? 0 : 3;
+            snprintf(cli->statusMsg, sizeof(cli->statusMsg), "%s",
+                     cli->disconnectReason == DISC_MATCH_OVER ? "Match complete." : "Disconnected by the server.");
         }
     }
 
     /* Watchdog: drop if no packet received for 5 seconds while connected */
-    if (cli->state == NET_CONNECTED && net_get_time_sec() - cli->lastPacketTime > 5.0) {
+    if ((cli->state == NET_CONNECTED || cli->state == NET_QUEUED) && net_get_time_sec() - cli->lastPacketTime > 5.0) {
         cli->state = NET_DISCONNECTED;
         cli->statusOk = 3; /* Red */
         snprintf(cli->statusMsg, sizeof(cli->statusMsg), "Lost connection to server (timed out).");

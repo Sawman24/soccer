@@ -5,7 +5,7 @@
 #include <string.h>
 
 #define SARP_NET_MAGIC      0x53415250   /* "SARP" */
-#define SARP_NET_VERSION    2            /* v2: input queue + rollback state */
+#define SARP_NET_VERSION    3            /* v3: quick-match queue, playlists, server bots */
 #define SARP_DEFAULT_PORT   7777
 #define SARP_MAX_CLIENTS    8
 #define SARP_TICK_RATE      60
@@ -14,6 +14,18 @@
 #define NCF_HAS_JUMPED   0x01
 #define NCF_HAS_FLIPPED  0x02
 #define NCF_BOOSTING     0x04
+#define NCF_BOT          0x08   /* AI-controlled (bot fill / replaced a leaver) */
+
+/* Playlists = players per team */
+#define PLAYLIST_DUEL      1
+#define PLAYLIST_DOUBLES   2
+#define PLAYLIST_STANDARD  3
+
+/* PktDisconnect.reason */
+#define DISC_USER_QUIT   0
+#define DISC_KICKED      1
+#define DISC_TIMEOUT     2
+#define DISC_MATCH_OVER  3
 
 /* NetCarState.in_buttons */
 #define NIB_JUMP         0x01
@@ -40,7 +52,8 @@ typedef enum PacketType {
     PKT_CLIENT_INPUT,
     PKT_SERVER_STATE,
     PKT_EVENT_GOAL,
-    PKT_EVENT_DEMO
+    PKT_EVENT_DEMO,
+    PKT_QUEUE_STATUS
 } PacketType;
 
 typedef struct NetHeader {
@@ -68,7 +81,8 @@ typedef struct PktJoinReq {
     char      player_name[24];
     uint8_t   car_model;     /* 0..12 */
     uint8_t   skin;          /* 0 = default livery, 1 = custom */
-    uint8_t   pref_team;     /* 0 = Blue, 1 = Orange, 2 = Auto */
+    uint8_t   pref_team;     /* (unused by quick match: teams are balanced by the server) */
+    uint8_t   playlist;      /* PLAYLIST_* (players per team) */
 } PktJoinReq;
 
 typedef struct PktJoinAck {
@@ -81,6 +95,18 @@ typedef struct PktJoinAck {
     uint16_t  tick_rate;     /* 60 */
     char      server_name[32];
 } PktJoinAck;
+
+/* Server -> client while searching (2 Hz). Doubles as the join acknowledgement. */
+typedef struct PktQueueStatus {
+    NetHeader header;
+    uint8_t   playlist;
+    uint8_t   in_queue;        /* players searching this playlist (incl. you) */
+    uint8_t   needed;          /* players for a full match */
+    uint8_t   matches_active;
+    uint16_t  players_online;
+    float     search_sec;      /* how long you have been searching */
+    float     bot_fill_sec;    /* time until bots fill the match (< 0 = never) */
+} PktQueueStatus;
 
 typedef struct PktDisconnect {
     NetHeader header;
@@ -154,6 +180,9 @@ typedef struct PktServerState {
     uint8_t      score_orange;
     uint8_t      countdown_sec;
     uint8_t      car_count;
+    uint8_t      your_slot;      /* recipient's car (per recipient) */
+    uint8_t      playlist;       /* players per team */
+    uint8_t      overtime;
     NetBallState ball;
     NetCarState  cars[SARP_MAX_CLIENTS];
 } PktServerState;
