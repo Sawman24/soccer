@@ -115,6 +115,9 @@ typedef struct Settings {
     /* camera */
     int   camShake, ballCamHold;        /* shake on goals/demos; ball cam toggle (0) or hold (1) */
     float camStiffness, camSwivel;      /* 0..1 how tightly the camera follows; right-stick swivel speed 1..10 */
+    /* interface */
+    int   plateMode;                    /* nameplates: 0 everyone, 1 teammates only, 2 off */
+    float plateAlpha;                   /* nameplate opacity 0.2..1 */
 } Settings;
 static Settings g_set = {
     .camDist = 4.6f, .camHeight = 0.44f, .fov = 75.0f, .boostFov = 1, .matchIdx = 1, .invertPitch = 0, .fullscreen = 0,
@@ -151,6 +154,7 @@ static void camera_defaults(void)
 {
     g_set.camShake = 1; g_set.ballCamHold = 0;
     g_set.camStiffness = 0.45f; g_set.camSwivel = 5.0f;
+    g_set.plateMode = 0; g_set.plateAlpha = 0.6f;
 }
 
 static void settings_path(char *out, size_t n) {
@@ -200,6 +204,8 @@ static void settings_load(void)
         else if (!strcmp(key, "ball_cam_hold"))   g_set.ballCamHold   = v != 0;
         else if (!strcmp(key, "camera_stiffness")) g_set.camStiffness = clampf(v, 0.0f, 1.0f);
         else if (!strcmp(key, "camera_swivel"))   g_set.camSwivel     = clampf(v, 1.0f, 10.0f);
+        else if (!strcmp(key, "nameplates"))      g_set.plateMode     = (int)clampf(v, 0, 2);
+        else if (!strcmp(key, "nameplate_opacity")) g_set.plateAlpha  = clampf(v, 0.2f, 1.0f);
         else if (!strncmp(key, "kb_", 3) || !strncmp(key, "pad_", 4)) {
             int isPad = key[0] == 'p', a, c0 = 0, c1 = 0;
             const char *nm = key + (isPad ? 4 : 3);
@@ -229,9 +235,9 @@ static void settings_save(void)
             g_set.mode, g_set.botSkill, g_set.shadows, g_set.bloom, g_set.skin,
             g_set.playlist, g_set.server[0] ? g_set.server : "127.0.0.1", g_set.name);
     fprintf(f, "deadzone=%.2f\ndodge_deadzone=%.2f\nsteer_sens=%.2f\naerial_sens=%.2f\nvibration=%d\npad_style=%d\n"
-               "camera_shake=%d\nball_cam_hold=%d\ncamera_stiffness=%.2f\ncamera_swivel=%.1f\n",
+               "camera_shake=%d\nball_cam_hold=%d\ncamera_stiffness=%.2f\ncamera_swivel=%.1f\nnameplates=%d\nnameplate_opacity=%.1f\n",
             g_set.deadzone, g_set.dodgeDeadzone, g_set.steerSens, g_set.aerialSens, g_set.vibration, g_set.padStyle,
-            g_set.camShake, g_set.ballCamHold, g_set.camStiffness, g_set.camSwivel);
+            g_set.camShake, g_set.ballCamHold, g_set.camStiffness, g_set.camSwivel, g_set.plateMode, g_set.plateAlpha);
     for (int a = 0; a < ACT_COUNT; a++)
         fprintf(f, "kb_%s=%d,%d\npad_%s=%d\n", ACT_KEYS[a], g_set.kb[a][0], g_set.kb[a][1], ACT_KEYS[a], g_set.pad[a]);
     fclose(f);
@@ -3082,39 +3088,62 @@ static void split_host_port(const char *in, char *host, int hostLen, int *port)
 /* ------------------------------------------------------------------------ */
 /* Online Multiplayer HUD & Scoreboard                                       */
 /* ------------------------------------------------------------------------ */
-static void net_client_draw_nameplates(const NetClient *cli, const Vector3 *carPositions, const int *carTeams, const int *demolished, Camera3D cam)
+/* Nameplates: small translucent tags that get out of the way while you play.
+ * Each plate fades (smoothly, per car) when the car is very close to the camera
+ * or far away, when it sits over the ball, and near the middle of the screen
+ * where you are usually looking; it also shrinks with distance. */
+typedef struct Plate { Vector3 pos; const char *name; int team, bot, show; } Plate;
+static float g_plateFade[MAX_CARS];
+
+static void draw_nameplates(const Plate *pl, int n, int myTeam, Vector3 ballPos, Camera3D cam, float dt)
 {
-    if (!cli || cli->state != NET_CONNECTED) return;
-    int sw = GetScreenWidth(), sh = GetScreenHeight();
-
-    for (int i = 0; i < SARP_MAX_CLIENTS; i++) {
-        if (!cli->players[i].active || i == cli->localSlot) continue;
-        if (demolished && demolished[i]) continue;
-
-        Vector3 headPos = V3(carPositions[i].x, carPositions[i].y + 1.8f, carPositions[i].z);
-        float dist = Vector3Distance(cam.position, headPos);
-        if (dist > 180.0f) continue;
-
-        Vector3 camToTarget = Vector3Subtract(headPos, cam.position);
-        Vector3 camFwd = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
-        if (Vector3DotProduct(camToTarget, camFwd) <= 0.1f) continue;
-
-        Vector2 sp = GetWorldToScreen(headPos, cam);
-        if (sp.x < -100 || sp.x > sw + 100 || sp.y < -100 || sp.y > sh + 100) continue;
-
-        const char *name = cli->players[i].isBot ? TextFormat("%s  BOT", cli->players[i].name) : cli->players[i].name;
-        int fontSize = dist < 40.0f ? 16 : dist < 90.0f ? 14 : 12;
-        int tw = MeasureText(name, fontSize);
-        int padX = 10, padY = 5;
-        Rectangle plate = { sp.x - tw / 2.0f - padX, sp.y - fontSize / 2.0f - padY, (float)tw + padX * 2, (float)fontSize + padY * 2 };
-
-        int team = (carTeams != NULL) ? carTeams[i] : cli->players[i].team;
-        Color teamBg = team == 0 ? (Color){ 20, 70, 160, 200 } : (Color){ 180, 70, 20, 200 };
-        Color teamBorder = team == 0 ? (Color){ 60, 150, 255, 230 } : (Color){ 255, 140, 50, 230 };
-
-        DrawRectangleRounded(plate, 0.4f, 4, teamBg);
-        DrawRectangleRoundedLinesEx(plate, 0.4f, 4, 1.2f, teamBorder);
-        DrawText(name, (int)plate.x + padX, (int)plate.y + padY, fontSize, RAYWHITE);
+    int sw = GetScreenWidth(), sh = GetScreenHeight(), i;
+    Vector3 camFwd = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
+    Vector3 camRight = Vector3Normalize(Vector3CrossProduct(camFwd, V3(0, 1, 0)));
+    Vector2 bs = { -9999, -9999 };
+    float br = 0.0f;
+    if (Vector3DotProduct(Vector3Subtract(ballPos, cam.position), camFwd) > 0.5f) {   /* ball's on-screen circle */
+        Vector2 e = GetWorldToScreen(Vector3Add(ballPos, Vector3Scale(camRight, BALL_R)), cam);
+        bs = GetWorldToScreen(ballPos, cam);
+        br = Vector2Distance(bs, e) + 10.0f;
+    }
+    for (i = 0; i < n && i < MAX_CARS; i++) {
+        Vector3 head = V3(pl[i].pos.x, pl[i].pos.y + 1.9f, pl[i].pos.z);
+        Vector3 toC = Vector3Subtract(head, cam.position);
+        float dist = Vector3Length(toC), target = 0.0f, a;
+        Vector2 sp = { 0, 0 };
+        int visible = pl[i].show && g_set.plateMode != 2 && !(g_set.plateMode == 1 && pl[i].team != myTeam) &&
+                      Vector3DotProduct(toC, camFwd) > 0.5f;
+        if (visible) {
+            float nearK = clampf((dist - 7.0f) / 8.0f, 0.0f, 1.0f);        /* right next to us: get out of the way */
+            float farK  = clampf((170.0f - dist) / 50.0f, 0.0f, 1.0f);     /* fade out in the distance */
+            float cx, cy, centre;
+            sp = GetWorldToScreen(head, cam);
+            cx = (sp.x - sw * 0.5f) / (sw * 0.5f); cy = (sp.y - sh * 0.5f) / (sh * 0.5f);
+            centre = 0.45f + 0.55f * clampf((sqrtf(cx * cx + cy * cy) - 0.12f) / 0.3f, 0.0f, 1.0f);   /* dim mid-screen */
+            target = nearK * farK * centre;
+            if (br > 0.0f && Vector2Distance(sp, bs) < br + 40.0f) target *= 0.2f;   /* never hide the ball */
+            if (pl[i].team != myTeam) target *= 0.85f;
+            if (sp.x < -80 || sp.x > sw + 80 || sp.y < -40 || sp.y > sh + 40) target = 0.0f;
+        }
+        g_plateFade[i] += (target - g_plateFade[i]) * (1.0f - expf(-10.0f * dt));
+        a = g_plateFade[i] * g_set.plateAlpha;
+        if (a < 0.02f || !visible) continue;
+        {
+            int fs = (int)clampf(17.0f - dist * 0.05f, 11.0f, 16.0f);
+            int tw = MeasureText(pl[i].name, fs), bw = pl[i].bot ? MeasureText("BOT", fs - 4) + 6 : 0;
+            float w = (float)(tw + bw) + 16.0f, h = (float)fs + 6.0f;
+            Rectangle r = { sp.x - w * 0.5f, sp.y - h, w, h };
+            Color tc = pl[i].team == 0 ? (Color){ 90, 165, 255, 255 } : (Color){ 255, 150, 60, 255 };
+            float ta = fminf(1.0f, a * 1.5f);   /* text stays readable while the plate itself is see-through */
+            DrawRectangleRounded(r, 0.5f, 6, (Color){ 6, 10, 18, (unsigned char)(110 * a) });
+            DrawRectangleRounded((Rectangle){ r.x + 5, r.y + h - 3, w - 10, 2 }, 1.0f, 4, ColorAlpha(tc, ta));
+            DrawText(pl[i].name, (int)(r.x + 8) + 1, (int)(r.y + 3) + 1, fs, (Color){ 0, 0, 0, (unsigned char)(150 * ta) });
+            DrawText(pl[i].name, (int)(r.x + 8), (int)(r.y + 3), fs, ColorAlpha(RAYWHITE, ta));
+            if (pl[i].bot) DrawText("BOT", (int)(r.x + 8 + tw + 6), (int)(r.y + 3 + 3), fs - 4, ColorAlpha((Color){ 170, 185, 205, 255 }, 0.9f * ta));
+            /* small pointer under the plate */
+            DrawTriangle((Vector2){ sp.x - 4, sp.y }, (Vector2){ sp.x, sp.y + 4 }, (Vector2){ sp.x + 4, sp.y }, ColorAlpha(tc, 0.7f * a));
+        }
     }
 }
 
@@ -4185,26 +4214,29 @@ int sarpbc_main(int argc, char **argv)
                                      isOnline ? (team[mySlot] == 0 ? "BLUE TEAM" : "ORANGE TEAM") : SKILL_NAMES[botSkill],
                                      g_set.showFps, g_set.showHints && screen == SCR_GAME);
 
-            if (!isOnline) {
-                for (i = 1; i < nCars; i++) {
-                    if (rcars[i].demolished) continue;
-                    Vector3 above = Vector3Add(rcars[i].pos, V3(0, 2.2f, 0));
-                    Vector3 toC = Vector3Subtract(above, cam.position);
-                    Vector2 sp;
-                    const char *tag = TextFormat("BOT %s", CAR_NAMES[carModel[i] < 0 ? 0 : carModel[i]]);
-                    if (Vector3DotProduct(toC, Vector3Subtract(cam.target, cam.position)) <= 0.0f) continue;   /* behind the camera */
-                    sp = GetWorldToScreen(above, cam);
-                    DrawText(tag, (int)sp.x - MeasureText(tag, 16) / 2, (int)sp.y, 16,
-                             team[i] == 0 ? (Color){ 120, 180, 255, 230 } : (Color){ 255, 170, 90, 230 });
+            if (screen == SCR_GAME || screen == SCR_PAUSE) {
+                Plate pl[MAX_CARS];
+                static char botNames[MAX_CARS][32];
+                int np = isOnline ? SARP_MAX_CLIENTS : nCars;
+                if (np > MAX_CARS) np = MAX_CARS;
+                for (i = 0; i < np; i++) {
+                    pl[i].pos = rcars[i].pos;
+                    pl[i].team = team[i];
+                    if (isOnline) {
+                        pl[i].name = netClient.players[i].name;
+                        pl[i].bot  = netClient.players[i].isBot;
+                        pl[i].show = netClient.players[i].active && i != mySlot && !rcars[i].demolished;
+                    } else {
+                        snprintf(botNames[i], sizeof(botNames[i]), "%s", CAR_NAMES[carModel[i] < 0 ? 0 : carModel[i]]);
+                        botNames[i][0] = (char)((botNames[i][0] >= 'a' && botNames[i][0] <= 'z') ? botNames[i][0] - 32 : botNames[i][0]);
+                        pl[i].name = botNames[i];
+                        pl[i].bot  = 1;
+                        pl[i].show = i != 0 && !rcars[i].demolished;
+                    }
                 }
-            } else {
-                Vector3 cpos[SARP_MAX_CLIENTS];
-                int cdemo[SARP_MAX_CLIENTS];
-                for (i = 0; i < SARP_MAX_CLIENTS; i++) {
-                    cpos[i] = rcars[i].pos;
-                    cdemo[i] = rcars[i].demolished;
-                }
-                net_client_draw_nameplates(&netClient, cpos, team, cdemo, cam);
+                draw_nameplates(pl, np, team[mySlot], rball.pos, cam, dt);
+            }
+            if (isOnline) {
                 net_client_draw_hud(&netClient, sw, sh);
                 if (act_down(ACT_SCOREBOARD)) {
                     net_client_draw_scoreboard(&netClient, sw, sh);
@@ -4654,6 +4686,16 @@ int sarpbc_main(int argc, char **argv)
                     y += h + gap;
                     if (ui_spinner((Rectangle){ x, y, w, h }, "SHOW CONTROL HINTS", ONOFF[g_set.showHints])) g_set.showHints = !g_set.showHints;
                     SET_DESC("Show your bindings along the bottom of the screen in game.");
+                    y += h + gap;
+                    {
+                        static const char *PLATE_MODES[3] = { "Everyone", "Teammates", "Off" };
+                        if ((d = ui_spinner((Rectangle){ x, y, w, h }, "NAMEPLATES", PLATE_MODES[g_set.plateMode]))) g_set.plateMode = (g_set.plateMode + d + 3) % 3;
+                        SET_DESC("Whose names float above their cars.");
+                    }
+                    y += h + gap;
+                    if ((d = ui_spinner((Rectangle){ x, y, w, h }, "NAMEPLATE OPACITY", TextFormat("%d%%", (int)roundf(g_set.plateAlpha * 100)))))
+                        g_set.plateAlpha = clampf(roundf((g_set.plateAlpha + 0.1f * d) * 10) / 10, 0.2f, 1.0f);
+                    SET_DESC("How solid nameplates look. They also fade near the ball, mid-screen and up close.");
                 }
                 if (desc) DrawText(desc, 64, sh - 66, 17, UI_TEXT);
                 ui_end();
