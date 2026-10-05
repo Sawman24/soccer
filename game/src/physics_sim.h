@@ -86,7 +86,11 @@
 #define BALL_R             1.62f
 #define BALL_MASS_RATIO    6.0f
 #define BALL_RESTITUTION   0.65f
-#define BALL_GROUND_FRICTION 0.12f
+#define BALL_GROUND_FRICTION 0.12f   /* max fraction of sliding speed a hard bounce removes */
+#define BALL_FRICTION_MU   0.25f     /* Coulomb: tangential loss <= mu * normal impulse */
+#define BALL_REST_VN       0.35f     /* below this impact speed (m/s) contacts don't bounce */
+#define BALL_SLIDE_VN      1.0f      /* impact speed (m/s) a contact needs before friction bites */
+#define BALL_ROLL_DECEL    0.35f     /* rolling resistance on a supporting surface (m/s^2) */
 #define BALL_GRAVITY_SCALE 0.8f
 #define BALL_HIT_SCALE     1.0f
 #define BALL_DRAG          0.03f
@@ -357,9 +361,14 @@ static Vector3 closest_on_tri(Vector3 p, Vector3 a, Vector3 b, Vector3 c, int *o
 
 static int arena_mesh_sphere(Vector3 *p, float r, float reach, Vector3 *normals, int maxN)
 {
-    int ids[256], n, i, nc = 0;
+    int ids[256], n, i, nc = 0, pass;
     Vector3 rad = V3(r, r, r);
     n = arena_query(Vector3Subtract(*p, rad), Vector3Add(*p, rad), ids, 256);
+    /* Pass 0 resolves face contacts, pass 1 edge/vertex contacts. Doing faces first
+     * means that once the sphere sits on a flat face, the shared edge of the
+     * neighbouring (coplanar) triangle is no longer penetrating, so it can't
+     * produce a tilted "internal edge" normal that snags whatever rolls over seams. */
+    for (pass = 0; pass < 2; pass++)
     for (i = 0; i < n; i++) {
         const ATri *t = &g_tris[ids[i]];
         float s = Vector3DotProduct(t->n, Vector3Subtract(*p, t->a)), pen;
@@ -367,6 +376,7 @@ static int arena_mesh_sphere(Vector3 *p, float r, float reach, Vector3 *normals,
         int onFace = 0;
         if (s < -reach || s > r) continue;
         q = closest_on_tri(*p, t->a, t->b, t->c, &onFace);
+        if (onFace != (pass == 0)) continue;
         d = Vector3Subtract(*p, q);
         if (s >= 0.0f) {
             float dist = Vector3Length(d);
@@ -835,6 +845,28 @@ static void ball_reset(Ball *b)
     b->rot = QuaternionIdentity();
 }
 
+/* Resolve the ball's velocity against one surface contact with normal n.
+ * Returns 1 if the ball was moving into the surface. Friction is proportional to
+ * how hard the ball hits (Coulomb), so a ball that is rolling or riding a curved
+ * wall keeps its speed, while a real bounce still scrubs off up to
+ * BALL_GROUND_FRICTION of the sliding speed. */
+static int ball_contact(Ball *b, Vector3 n)
+{
+    float vn = Vector3DotProduct(b->vel, n);
+    if (vn >= 0.0f) return 0;
+    Vector3 vt = Vector3Subtract(b->vel, Vector3Scale(n, vn));
+    float impact = -vn;
+    float e = impact < BALL_REST_VN ? 0.0f : BALL_RESTITUTION;
+    float st = Vector3Length(vt), k = 1.0f;
+    if (st > 1e-4f && impact > BALL_SLIDE_VN) {
+        float loss = fminf(BALL_FRICTION_MU * (1.0f + e) * (impact - BALL_SLIDE_VN),
+                           BALL_GROUND_FRICTION * st);
+        k = (st - loss) / st;
+    }
+    b->vel = Vector3Add(Vector3Scale(n, impact * e), Vector3Scale(vt, k));
+    return 1;
+}
+
 static void ball_step(Ball *b, float dt)
 {
     b->vel.y -= GRAVITY * BALL_GRAVITY_SCALE * dt;
@@ -844,17 +876,13 @@ static void ball_step(Ball *b, float dt)
     float sp = Vector3Length(b->vel);
     if (sp > BALL_MAX_SPEED) b->vel = Vector3Scale(b->vel, BALL_MAX_SPEED / sp);
 
+    int support = 0;
+    Vector3 supN = V3(0, 1, 0);
     if (g_tris) {
         Vector3 ns[16];
         int nc = arena_mesh_sphere(&b->pos, BALL_R, BALL_R, ns, 16);
         for (int i = 0; i < nc; i++) {
-            Vector3 n = ns[i];
-            float vn = Vector3DotProduct(b->vel, n);
-            if (vn < 0.0f) {
-                Vector3 vt = Vector3Subtract(b->vel, Vector3Scale(n, vn));
-                b->vel = Vector3Add(Vector3Scale(n, -vn * BALL_RESTITUTION),
-                                    Vector3Scale(vt, 1.0f - BALL_GROUND_FRICTION));
-            }
+            if (ball_contact(b, ns[i]) && ns[i].y > supN.y * support) { supN = ns[i]; support = 1; }
         }
     } else {
         APlane pl[16];
@@ -864,15 +892,21 @@ static void ball_step(Ball *b, float dt)
             if (dist < BALL_R) {
                 Vector3 n = pl[i].n;
                 b->pos = Vector3Add(b->pos, Vector3Scale(n, BALL_R - dist));
-                float vn = Vector3DotProduct(b->vel, n);
-                if (vn < 0.0f) {
-                    Vector3 vt = Vector3Subtract(b->vel, Vector3Scale(n, vn));
-                    b->vel = Vector3Add(Vector3Scale(n, -vn * BALL_RESTITUTION),
-                                        Vector3Scale(vt, 1.0f - BALL_GROUND_FRICTION));
-                }
+                if (ball_contact(b, n) && n.y > supN.y * support) { supN = n; support = 1; }
             }
         }
         sphere_vs_posts(&b->pos, &b->vel, BALL_R, BALL_RESTITUTION);
+    }
+    /* Rolling resistance: a small constant deceleration while resting on a floor or
+     * ramp (applied once per tick, not per contact, so seams don't add drag). */
+    if (support && supN.y > 0.3f) {
+        float vn = Vector3DotProduct(b->vel, supN);
+        Vector3 vt = Vector3Subtract(b->vel, Vector3Scale(supN, vn));
+        float st = Vector3Length(vt);
+        if (st > 1e-4f) {
+            float k = fmaxf(st - BALL_ROLL_DECEL * dt, 0.0f) / st;
+            b->vel = Vector3Add(Vector3Scale(supN, vn), Vector3Scale(vt, k));
+        }
     }
 
     float w = Vector3Length(b->vel) / BALL_R;
